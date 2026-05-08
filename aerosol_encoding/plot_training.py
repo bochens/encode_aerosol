@@ -43,18 +43,22 @@ def main() -> None:
         axes[0].plot(history["epoch"], history["validation_loss"], label="validation", linewidth=2)
         best_col = "validation_loss"
     else:
-        axes[0].plot(
-            history["epoch"],
-            history["validation_reconstruction_loss"],
-            label="validation reconstruction",
-            linewidth=2,
-        )
-        axes[0].plot(
-            history["epoch"],
-            history["validation_cross_loss"],
-            label="validation selected cross-prediction",
-            linewidth=2,
-        )
+        best_col = "train_loss"
+        if "validation_reconstruction_loss" in history:
+            axes[0].plot(
+                history["epoch"],
+                history["validation_reconstruction_loss"],
+                label="validation reconstruction",
+                linewidth=2,
+            )
+        if "validation_cross_loss" in history:
+            axes[0].plot(
+                history["epoch"],
+                history["validation_cross_loss"],
+                label="validation selected cross-prediction",
+                linewidth=2,
+            )
+            best_col = "validation_cross_loss"
         if "validation_strict_group_out_loss" in history:
             axes[0].plot(
                 history["epoch"],
@@ -63,7 +67,6 @@ def main() -> None:
                 linewidth=1.5,
                 linestyle="--",
             )
-        best_col = "validation_cross_loss"
 
     best_idx = history[best_col].idxmin()
     best_epoch = history.loc[best_idx, "epoch"]

@@ -71,6 +71,9 @@ min_feature_coverage: 0.005
 min_feature_std: 0.001
 validation_fraction: 0.15
 test_fraction: 0.15
+validation_interval: 5
+reconstruction_validation_interval: 0
+diagnostic_validation_interval: 20
 seed: 42
 
 training_stages:

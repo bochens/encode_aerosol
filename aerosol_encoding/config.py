@@ -86,6 +86,9 @@ class ExperimentConfig:
     min_feature_std: float
     validation_fraction: float
     test_fraction: float
+    validation_interval: int
+    reconstruction_validation_interval: int
+    diagnostic_validation_interval: int
     seed: int
     training_stages: tuple[dict[str, Any], ...]
     cross_prediction_selection_mode: str
@@ -348,6 +351,11 @@ def load_config(path: str | Path) -> ExperimentConfig:
         min_feature_std=float(raw.get("min_feature_std", 1e-12)),
         validation_fraction=float(raw.get("validation_fraction", 0.15)),
         test_fraction=float(raw.get("test_fraction", 0.15)),
+        validation_interval=int(raw.get("validation_interval", 1)),
+        reconstruction_validation_interval=int(
+            raw.get("reconstruction_validation_interval", 1)
+        ),
+        diagnostic_validation_interval=int(raw.get("diagnostic_validation_interval", 1)),
         seed=int(raw.get("seed", 42)),
         training_stages=tuple(raw.get("training_stages", ())),
         cross_prediction_selection_mode=cross_prediction_selection_mode,
@@ -416,6 +424,9 @@ def config_to_metadata(config: ExperimentConfig) -> dict[str, Any]:
         "min_feature_std": config.min_feature_std,
         "validation_fraction": config.validation_fraction,
         "test_fraction": config.test_fraction,
+        "validation_interval": config.validation_interval,
+        "reconstruction_validation_interval": config.reconstruction_validation_interval,
+        "diagnostic_validation_interval": config.diagnostic_validation_interval,
         "seed": config.seed,
         "training_stages": list(config.training_stages),
         "cross_prediction_selection_mode": config.cross_prediction_selection_mode,

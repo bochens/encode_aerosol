@@ -572,6 +572,12 @@ def write_history(path: Path, history: list[dict[str, float]]) -> None:
         writer.writerows(history)
 
 
+def should_run_interval(epoch: int, total_epochs: int, interval: int) -> bool:
+    if interval <= 0:
+        return False
+    return epoch == 1 or epoch == total_epochs or epoch % interval == 0
+
+
 def validate_resume_checkpoint(
     checkpoint: dict[str, Any],
     model: torch.nn.Module,
@@ -743,6 +749,8 @@ def main() -> None:
         validation_cross_mode,
         config.cross_prediction_exclusion_groups,
     )
+    if config.validation_interval <= 0:
+        raise ValueError("validation_interval must be positive so a best checkpoint can be selected")
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
 
@@ -833,47 +841,69 @@ def main() -> None:
                 device=device,
                 optimizer=optimizer,
             )
-            validation_reconstruction_metrics = run_epoch(
-                model,
-                validation_loader,
-                arrays,
-                target_modalities,
-                always_input_modalities,
-                config.cross_prediction_exclusion_groups,
-                stage_mode="autoencode",
-                loss_mode="all",
-                mask_probability=0.0,
-                feature_dropout_probability=0.0,
-                feature_noise_std=0.0,
-                latent_l2_weight=0.0,
-                kl_weight=0.0,
-                closure_losses=None,
-                device=device,
-                optimizer=None,
+            run_cross_validation = should_run_interval(
+                global_epoch,
+                total_epochs,
+                config.validation_interval,
             )
-            validation_cross_metrics = run_cross_prediction_epoch(
-                model,
-                validation_loader,
-                arrays,
-                target_modalities,
-                always_input_modalities,
-                config.cross_prediction_exclusion_groups,
-                stage_mode=validation_cross_mode,
-                device=device,
+            run_reconstruction_validation = should_run_interval(
+                global_epoch,
+                total_epochs,
+                config.reconstruction_validation_interval,
             )
-            diagnostic_validation_metrics = {
-                label: run_cross_prediction_epoch(
+            run_diagnostic_validation = should_run_interval(
+                global_epoch,
+                total_epochs,
+                config.diagnostic_validation_interval,
+            )
+
+            validation_reconstruction_metrics: dict[str, float] = {}
+            if run_reconstruction_validation:
+                validation_reconstruction_metrics = run_epoch(
                     model,
                     validation_loader,
                     arrays,
                     target_modalities,
                     always_input_modalities,
                     config.cross_prediction_exclusion_groups,
-                    stage_mode=mode,
+                    stage_mode="autoencode",
+                    loss_mode="all",
+                    mask_probability=0.0,
+                    feature_dropout_probability=0.0,
+                    feature_noise_std=0.0,
+                    latent_l2_weight=0.0,
+                    kl_weight=0.0,
+                    closure_losses=None,
+                    device=device,
+                    optimizer=None,
+                )
+            validation_cross_metrics: dict[str, float] = {}
+            if run_cross_validation:
+                validation_cross_metrics = run_cross_prediction_epoch(
+                    model,
+                    validation_loader,
+                    arrays,
+                    target_modalities,
+                    always_input_modalities,
+                    config.cross_prediction_exclusion_groups,
+                    stage_mode=validation_cross_mode,
                     device=device,
                 )
-                for label, mode in diagnostic_validation_modes
-            }
+            diagnostic_validation_metrics: dict[str, dict[str, float]] = {}
+            if run_diagnostic_validation:
+                diagnostic_validation_metrics = {
+                    label: run_cross_prediction_epoch(
+                        model,
+                        validation_loader,
+                        arrays,
+                        target_modalities,
+                        always_input_modalities,
+                        config.cross_prediction_exclusion_groups,
+                        stage_mode=mode,
+                        device=device,
+                    )
+                    for label, mode in diagnostic_validation_modes
+                }
             row = {
                 "epoch": float(global_epoch),
                 "stage_epoch": float(stage_epoch),
@@ -891,19 +921,32 @@ def main() -> None:
                 f"val_{label}={metrics['loss']:.5f}"
                 for label, metrics in diagnostic_validation_metrics.items()
             )
+            validation_text_parts = []
+            if validation_reconstruction_metrics:
+                validation_text_parts.append(
+                    f"val_recon={validation_reconstruction_metrics['loss']:.5f}"
+                )
+            else:
+                validation_text_parts.append("val_recon=skipped")
+            if validation_cross_metrics:
+                validation_text_parts.append(
+                    f"val_cross={validation_cross_metrics['loss']:.5f}"
+                )
+            else:
+                validation_text_parts.append("val_cross=skipped")
+            if diagnostic_text:
+                validation_text_parts.append(diagnostic_text)
             history.append(row)
             write_history(output / "history.csv", history)
             print(
                 f"epoch={global_epoch} stage={stage_name} mode={stage_mode} "
                 f"loss_mode={stage_loss_mode} "
                 f"train_loss={train_metrics['loss']:.5f} "
-                f"val_recon={validation_reconstruction_metrics['loss']:.5f} "
-                f"val_cross={validation_cross_metrics['loss']:.5f} "
-                f"{diagnostic_text}",
+                f"{' '.join(validation_text_parts)}",
                 flush=True,
             )
 
-            if validation_cross_metrics["loss"] < best_validation:
+            if validation_cross_metrics and validation_cross_metrics["loss"] < best_validation:
                 best_validation = validation_cross_metrics["loss"]
             if scheduler is not None:
                 scheduler.step()
@@ -920,7 +963,7 @@ def main() -> None:
                 global_epoch=global_epoch,
                 best_validation=best_validation,
             )
-            if validation_cross_metrics["loss"] <= best_validation:
+            if validation_cross_metrics and validation_cross_metrics["loss"] <= best_validation:
                 torch.save(payload, output / "checkpoint.pt")
             torch.save(payload, output / "last_checkpoint.pt")
 
