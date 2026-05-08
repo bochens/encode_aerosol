@@ -1,0 +1,233 @@
+data_root: /Volumes/Hailstone Data/DOE_SGP
+freq: 1h
+split_strategy: calendar_day_hash
+feature_coverage_basis: all
+model_type: hierarchical_poe_transformer_vae
+latent_dim: 512
+hidden_dim: 192
+encoder_depth: 2
+decoder_depth: 2
+transformer_layers: 2
+transformer_heads: 6
+sequence_encoder_type: diameter_transformer
+sequence_fourier_frequencies: 6
+sequence_transformer_heads: 6
+conditional_ccn_decoder: true
+size_grid:
+  enabled: true
+  min_diameter_nm: 3.0
+  max_diameter_nm: 30000.0
+  bins: 160
+  interpolation: linear_log_diameter
+  diameter_units:
+    diameter_mobility: nm
+    diameter_optical: nm
+    diameter_aerodynamic: um
+    diameter_midpoint: um
+closure_loss_weights:
+  dry_scattering_from_size_composition: 0.03
+  humidification_response: 0.03
+  ccn_activation_ratio: 0.02
+latent_blocks:
+  global: 96
+  size: 192
+  composition: 80
+  hygroscopic: 64
+  optical: 64
+  nuisance: 16
+block_modality_map:
+  global: [met_context, chemistry_acsm, size_smps, size_aps, size_uhsas, size_opc, cpc_number, ccn_activation, optical_neph]
+  size: [size_smps, size_aps, size_uhsas, size_opc, cpc_number, ccn_activation, optical_neph]
+  composition: [chemistry_acsm, optical_neph]
+  hygroscopic: [ccn_activation, optical_neph, chemistry_acsm, size_smps, size_aps, size_uhsas, size_opc]
+  optical: [optical_neph, size_smps, size_aps, size_uhsas, size_opc, chemistry_acsm]
+  nuisance: [met_context, chemistry_acsm, size_smps, size_aps, size_uhsas, size_opc, cpc_number, ccn_activation, optical_neph]
+cross_prediction_exclusion_groups:
+  - [size_smps, size_aps, size_uhsas, size_opc]
+batch_size: 64
+learning_rate: 0.0008
+learning_rate_schedule: cosine
+min_learning_rate: 0.00005
+weight_decay: 0.00001
+input_mask_probability: 0.35
+latent_l2_weight: 0.000001
+kl_weight: 0.0005
+min_feature_coverage: 0.01
+validation_fraction: 0.15
+test_fraction: 0.15
+seed: 42
+training_stages:
+  - name: deterministic_autoencode_warmup
+    mode: autoencode
+    loss_mode: all
+    epochs: 25
+    feature_dropout_probability: 0.0
+    feature_noise_std: 0.0
+    kl_weight: 0.0
+  - name: vae_denoise_autoencode
+    mode: autoencode
+    loss_mode: all
+    epochs: 35
+    feature_dropout_probability: 0.05
+    feature_noise_std: 0.03
+    kl_weight: 0.00005
+  - name: mild_masked_hidden_only
+    mode: random_mask
+    loss_mode: hidden_only
+    epochs: 45
+    input_mask_probability: 0.20
+    feature_dropout_probability: 0.03
+    feature_noise_std: 0.02
+    kl_weight: 0.00015
+  - name: hard_masked_hidden_only
+    mode: random_mask
+    loss_mode: hidden_only
+    epochs: 55
+    input_mask_probability: 0.45
+    feature_dropout_probability: 0.02
+    feature_noise_std: 0.01
+    kl_weight: 0.0003
+  - name: leave_one_family_out_hidden_only
+    mode: leave_one_out
+    loss_mode: hidden_only
+    epochs: 60
+    feature_dropout_probability: 0.0
+    feature_noise_std: 0.0
+    kl_weight: 0.0004
+  - name: leave_one_group_out_hidden_only
+    mode: leave_one_out_unrelated
+    loss_mode: hidden_only
+    epochs: 80
+    feature_dropout_probability: 0.0
+    feature_noise_std: 0.0
+    kl_weight: 0.0005
+
+modalities:
+  met_context:
+    role: context
+    always_input: true
+    streams:
+      - name: aosmet_e13
+        path: sgpaosmetE13.a1
+        variables:
+          - {name: rh_ambient}
+          - {name: temperature_ambient}
+          - {name: pressure_ambient}
+          - {name: wind_speed}
+          - {name: wind_direction, transform: angle_degrees}
+          - {name: rain_amount}
+          - {name: rain_intensity}
+
+  chemistry_acsm:
+    role: target
+    streams:
+      - name: acsm_cdce_e13
+        path: sgpacsmcdceE13.c2
+        variables:
+          - {name: total_organics_CDCE, transform: log1p_nonnegative}
+          - {name: sulfate_CDCE, transform: log1p_nonnegative}
+          - {name: ammonium_CDCE, transform: log1p_nonnegative}
+          - {name: nitrate_CDCE, transform: log1p_nonnegative}
+          - {name: chloride_CDCE, transform: log1p_nonnegative}
+          - {name: acsm_vol_conc, transform: log1p_nonnegative}
+          - {name: CDCE}
+
+  size_smps:
+    role: target
+    streams:
+      - name: smps_e13
+        path: sgpaossmpsE13.b1
+        variables:
+          - {name: dN_dlogDp, transform: log1p_nonnegative}
+          - {name: total_N_conc, transform: log1p_nonnegative}
+          - {name: total_SA_conc, transform: log1p_nonnegative}
+          - {name: total_V_conc, transform: log1p_nonnegative}
+          - {name: geometric_mean, transform: log1p_nonnegative}
+          - {name: geometric_std}
+          - {name: mean, transform: log1p_nonnegative}
+          - {name: median, transform: log1p_nonnegative}
+          - {name: mode, transform: log1p_nonnegative}
+
+  size_aps:
+    role: target
+    streams:
+      - name: aps_e13
+        path: sgpaosapsE13.b1
+        variables:
+          - {name: dN_dlogDp, transform: log1p_nonnegative}
+          - {name: total_N_conc, transform: log1p_nonnegative}
+          - {name: total_SA_conc, transform: log1p_nonnegative}
+          - {name: total_V_conc, transform: log1p_nonnegative}
+
+  size_uhsas:
+    role: target
+    streams:
+      - name: uhsas_e13
+        path: sgpaosuhsasE13.b1
+        variables:
+          - {name: dN_dlogDp, transform: log1p_nonnegative}
+          - {name: total_N_conc, transform: log1p_nonnegative}
+          - {name: total_SA_conc, transform: log1p_nonnegative}
+          - {name: total_V_conc, transform: log1p_nonnegative}
+
+  size_opc:
+    role: target
+    streams:
+      - name: opc_e13
+        path: sgpaosopcE13.b1
+        required: false
+        variables:
+          - {name: dN_dlogDp, transform: log1p_nonnegative}
+          - {name: total_N_conc, transform: log1p_nonnegative}
+          - {name: total_SA_conc, transform: log1p_nonnegative}
+          - {name: total_V_conc, transform: log1p_nonnegative}
+
+  cpc_number:
+    role: target
+    streams:
+      - name: cpcf_e13
+        path: sgpaoscpcfE13.b1
+        variables:
+          - {name: concentration, transform: log1p_nonnegative}
+      - name: cpcuf_e13
+        path: sgpaoscpcufE13.b1
+        variables:
+          - {name: concentration, transform: log1p_nonnegative}
+
+  ccn_activation:
+    role: target
+    streams:
+      - name: ccn2colb_e13
+        path: sgpaosccn2colbE13.b1
+        variables:
+          - {name: N_CCN, transform: log1p_nonnegative}
+          - {name: supersaturation_calculated}
+          - {name: supersaturation_set_point}
+
+  optical_neph:
+    role: target
+    streams:
+      - name: neph_dry_e13
+        path: sgpaosnephdry1mE13.b1
+        variables:
+          - {name: Bs_B_Dry_Neph3W, transform: log1p_nonnegative}
+          - {name: Bs_G_Dry_Neph3W, transform: log1p_nonnegative}
+          - {name: Bs_R_Dry_Neph3W, transform: log1p_nonnegative}
+          - {name: Bbs_B_Dry_Neph3W, transform: log1p_nonnegative}
+          - {name: Bbs_G_Dry_Neph3W, transform: log1p_nonnegative}
+          - {name: Bbs_R_Dry_Neph3W, transform: log1p_nonnegative}
+          - {name: RH_Neph_Dry}
+          - {name: T_Neph_Dry}
+          - {name: P_Neph_Dry}
+      - name: neph_wet_e13
+        path: sgpaosnephwetE13.b1
+        variables:
+          - {name: Bs_B_Wet_Neph3W, transform: log1p_nonnegative}
+          - {name: Bs_G_Wet_Neph3W, transform: log1p_nonnegative}
+          - {name: Bs_R_Wet_Neph3W, transform: log1p_nonnegative}
+          - {name: Bbs_B_Wet_Neph3W, transform: log1p_nonnegative}
+          - {name: Bbs_G_Wet_Neph3W, transform: log1p_nonnegative}
+          - {name: Bbs_R_Wet_Neph3W, transform: log1p_nonnegative}
+          - {name: RH_Neph_Wet}
+          - {name: T_Neph_Wet}
+          - {name: P_Neph_Wet}

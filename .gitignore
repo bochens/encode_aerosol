@@ -1,0 +1,21 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local environments
+.venv/
+.venv_*/
+
+# Large generated research artifacts
+artifacts/
+figures/
+*.pt
+*.pth
+*.npz
+*.npy
+
+# Notebook/runtime noise
+.ipynb_checkpoints/
