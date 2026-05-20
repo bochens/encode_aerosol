@@ -1,0 +1,20 @@
+prepared_arrays: artifacts/temporal_gru_30min_20161129_20230421/features/prepared_arrays.npz
+output: artifacts/random_forest_ccn_baseline
+train_split: train
+eval_split: test
+
+inputs:
+  acsm: log1p time_bin_000 organics, sulfate, ammonium, nitrate, chloride
+  require_complete_acsm: true
+  size_distribution: merged log1p dN/dlogDp from SMPS, UHSAS, OPC, and APS
+  coordinate: CCN supersaturation percent
+  merge_transition_decades: 0.08
+
+random_forest:
+  max_train_samples: 100000
+  max_eval_samples: null
+  n_estimators: 100
+  max_depth: null
+  min_samples_leaf: 5
+  max_features: sqrt
+  random_state: 20260517

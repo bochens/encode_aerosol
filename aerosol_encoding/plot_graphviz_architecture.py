@@ -281,7 +281,7 @@ def build_overview_graph(checkpoint: Mapping[str, object]):
                 for modality in sizing_modalities
             ),
             "shared log-Dp grid and time bins where configured",
-            "instrument identity retained",
+            "separate sizing modality tokens retained",
             "missing instruments are masked",
         ),
         "size",
@@ -363,7 +363,7 @@ def build_overview_graph(checkpoint: Mapping[str, object]):
         (
             f"{len(modalities)} possible instrument tokens",
             "hidden instruments are masked before fusion",
-            "instrument identity embeddings stay attached",
+            "modality embeddings stay attached to tokens",
         ),
         "token",
     )

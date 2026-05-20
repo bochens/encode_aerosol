@@ -1,4 +1,4 @@
-data_root: /Volumes/Hailstone Data/DOE_SGP
+data_root: data/DOE_SGP
 freq: 1h
 model_type: hierarchical_poe_transformer_vae
 latent_dim: 128

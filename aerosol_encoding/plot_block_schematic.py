@@ -115,7 +115,7 @@ def draw_overall(config_path: Path, output: Path) -> None:
     )
 
     input_text = (
-        "Hourly multimodal inputs\n\n"
+        "30-minute multimodal inputs\n\n"
         "AOSMET context\nACSM chemistry\nSMPS / APS / UHSAS / OPC size spectra\n"
         "CPC number\nCCN activation\nDry + wet neph\n\n"
         "Each feature carries value + observed mask"
@@ -128,7 +128,8 @@ def draw_overall(config_path: Path, output: Path) -> None:
     )
     token_text = (
         "Tokenization\n\n"
-        "one 192-D token per modality\n+ one learned 192-D latent query\n\n"
+        f"one {config.hidden_dim}-D token per modality\n"
+        f"+ one learned {config.hidden_dim}-D latent query\n\n"
         "input visibility mask removes\nhidden instruments from attention"
     )
     fusion_text = (
@@ -173,19 +174,20 @@ def draw_overall(config_path: Path, output: Path) -> None:
     save(fig, output)
 
 
-def draw_fusion(output: Path) -> None:
+def draw_fusion(config_path: Path, output: Path) -> None:
+    config = load_config(config_path)
     fig, ax = setup_axis((11.5, 7.0))
     ax.text(0.5, 0.95, "Transformer fusion block", ha="center", va="top", fontsize=19, weight="bold")
 
-    add_box(ax, (0.06, 0.61), 0.22, 0.18, "Visible modality tokens\nT_met, T_acsm, ...\nshape: M x 192", COLORS["token"])
-    add_box(ax, (0.06, 0.31), 0.22, 0.16, "Latent query token\nlearned parameter\nshape: 1 x 192", COLORS["token"])
+    add_box(ax, (0.06, 0.61), 0.22, 0.18, f"Visible modality tokens\nT_met, T_acsm, ...\nshape: M x {config.hidden_dim}", COLORS["token"])
+    add_box(ax, (0.06, 0.31), 0.22, 0.16, f"Latent query token\nlearned parameter\nshape: 1 x {config.hidden_dim}", COLORS["token"])
     add_box(ax, (0.37, 0.54), 0.20, 0.18, "Concatenate tokens\n[M visible tokens\n+ 1 latent query]", COLORS["fusion"])
     add_box(ax, (0.37, 0.26), 0.20, 0.16, "Key-padding mask\nhidden modalities ignored\nlatent query kept", COLORS["loss"])
-    add_box(ax, (0.66, 0.60), 0.22, 0.14, "Multi-head self-attention\n6 heads", COLORS["fusion"])
+    add_box(ax, (0.66, 0.60), 0.22, 0.14, f"Multi-head self-attention\n{config.transformer_heads} heads", COLORS["fusion"])
     add_box(ax, (0.66, 0.42), 0.22, 0.12, "Residual + LayerNorm", COLORS["fusion"])
-    add_box(ax, (0.66, 0.27), 0.22, 0.12, "Feed-forward MLP\n192 -> 768 -> 192", COLORS["fusion"])
-    add_box(ax, (0.66, 0.11), 0.22, 0.12, "Residual + LayerNorm\nrepeat x2 layers", COLORS["fusion"])
-    add_box(ax, (0.38, 0.06), 0.20, 0.12, "Read out latent-query row\nMLP: 192 -> 192 -> 256", COLORS["latent"])
+    add_box(ax, (0.66, 0.27), 0.22, 0.12, f"Feed-forward MLP\n{config.hidden_dim} -> {config.hidden_dim * 4} -> {config.hidden_dim}", COLORS["fusion"])
+    add_box(ax, (0.66, 0.11), 0.22, 0.12, f"Residual + LayerNorm\nrepeat x{config.transformer_layers} layers", COLORS["fusion"])
+    add_box(ax, (0.38, 0.06), 0.20, 0.12, f"Read latent-query row\nMLP: {config.hidden_dim} -> {config.hidden_dim} -> {config.latent_dim}", COLORS["latent"])
 
     add_arrow(ax, (0.28, 0.70), (0.37, 0.64))
     add_arrow(ax, (0.28, 0.39), (0.37, 0.60), rad=0.08)
@@ -199,7 +201,7 @@ def draw_fusion(output: Path) -> None:
     ax.text(
         0.5,
         0.015,
-        "Only the latent-query output becomes the aerosol encoding; hidden instrument tokens are present in memory but masked from attention evidence.",
+        "Only the latent-query output becomes the aerosol encoding; hidden instrument tokens are key-masked from attention evidence.",
         ha="center",
         va="bottom",
         fontsize=10,
@@ -342,7 +344,7 @@ def draw_sizing_crosstalk(output: Path) -> None:
         (0.59, 0.06),
         0.34,
         0.13,
-        "Current checkpoint selection uses Case B for sizing targets.\nThe saved skill CSV also reports Case A and pairwise tests.",
+        "Checkpoint selection uses Case A leave-one-out validation.\nCase B is tracked as a strict diagnostic.",
         COLORS["loss"],
         fontsize=9,
     )
@@ -370,7 +372,7 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     config_path = Path(args.config)
     draw_overall(config_path, output_dir / "aerosol_block_schematic_overall.png")
-    draw_fusion(output_dir / "aerosol_block_schematic_fusion.png")
+    draw_fusion(config_path, output_dir / "aerosol_block_schematic_fusion.png")
     draw_training(output_dir / "aerosol_block_schematic_training.png")
     draw_sizing_crosstalk(output_dir / "aerosol_block_schematic_sizing_crosstalk.png")
     print(f"wrote {output_dir / 'aerosol_block_schematic_overall.png'}")

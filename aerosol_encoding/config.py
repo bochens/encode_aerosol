@@ -50,6 +50,20 @@ class TemporalWindowSpec:
 
 
 @dataclass(frozen=True)
+class ResponseLossSpec:
+    kind: str = "mse"
+    smooth_l1_beta: float = 0.5
+    huber_delta: float = 1.0
+
+
+@dataclass(frozen=True)
+class DataLoaderSpec:
+    num_workers: int = 0
+    persistent_workers: bool = False
+    prefetch_factor: int | None = None
+
+
+@dataclass(frozen=True)
 class ExperimentConfig:
     data_root: Path
     freq: str
@@ -62,18 +76,24 @@ class ExperimentConfig:
     decoder_depth: int
     transformer_layers: int
     transformer_heads: int
+    transformer_ff_multiplier: float
+    latent_head_hidden_dim: int
     sequence_encoder_type: str
     sequence_fourier_frequencies: int
     sequence_transformer_heads: int
     conditional_ccn_decoder: bool
+    coordinate_decoders: dict[str, bool]
+    instrument_pretraining: bool
     sizing_crosstalk_layers: int
     sizing_crosstalk_heads: int
     decoder_expansion_depth: int
+    decoder_expansion_hidden_dim: int
     latent_blocks: dict[str, int]
     block_modality_map: dict[str, tuple[str, ...]]
     size_grid: SizeGridSpec
     temporal_windows: TemporalWindowSpec
     batch_size: int
+    dataloader: DataLoaderSpec
     learning_rate: float
     learning_rate_schedule: str
     min_learning_rate: float
@@ -82,6 +102,8 @@ class ExperimentConfig:
     latent_l2_weight: float
     kl_weight: float
     closure_loss_weights: dict[str, float]
+    size_spectral_loss_weights: dict[str, float]
+    response_loss: ResponseLossSpec
     min_feature_coverage: float
     min_feature_std: float
     validation_fraction: float
@@ -163,6 +185,15 @@ def load_config(path: str | Path) -> ExperimentConfig:
     latent_dim = int(raw.get("latent_dim", 32))
     hidden_dim = int(raw.get("hidden_dim", 128))
     transformer_heads = int(raw.get("transformer_heads", 4))
+    transformer_ff_multiplier = float(raw.get("transformer_ff_multiplier", 4.0))
+    if transformer_ff_multiplier < 1.0:
+        raise ValueError("transformer_ff_multiplier must be at least 1.0")
+    latent_head_hidden_dim = int(raw.get("latent_head_hidden_dim", raw.get("hidden_dim", 128)))
+    if latent_head_hidden_dim < latent_dim:
+        raise ValueError(
+            "latent_head_hidden_dim should be at least latent_dim so the latent "
+            "head does not narrow before the bottleneck"
+        )
     if model_type in {"structured_transformer_autoencoder", "structured_transformer_vae"}:
         if latent_blocks:
             raise ValueError(
@@ -210,6 +241,26 @@ def load_config(path: str | Path) -> ExperimentConfig:
     decoder_expansion_depth = int(raw.get("decoder_expansion_depth", 0))
     if decoder_expansion_depth < 0:
         raise ValueError("decoder_expansion_depth must be nonnegative")
+    decoder_expansion_hidden_dim = int(raw.get("decoder_expansion_hidden_dim", hidden_dim))
+    if decoder_expansion_hidden_dim < hidden_dim:
+        raise ValueError("decoder_expansion_hidden_dim must be at least hidden_dim")
+    coordinate_decoders = {
+        str(name): bool(value)
+        for name, value in dict(raw.get("coordinate_decoders", {})).items()
+    }
+    allowed_coordinate_decoders = {
+        "ccn_activation",
+        "size_spectra",
+        "optical_neph",
+    }
+    unknown_coordinate_decoders = sorted(
+        set(coordinate_decoders) - allowed_coordinate_decoders
+    )
+    if unknown_coordinate_decoders:
+        raise ValueError(
+            "coordinate_decoders contains unsupported entries: "
+            + ", ".join(unknown_coordinate_decoders)
+        )
     if latent_blocks and sum(latent_blocks.values()) != latent_dim:
         raise ValueError(
             "latent_dim must equal the sum of latent_blocks for hierarchical models: "
@@ -301,11 +352,72 @@ def load_config(path: str | Path) -> ExperimentConfig:
         } or None,
         modality_stats=temporal_modality_stats or None,
     )
+    response_loss_raw = raw.get("response_loss", {}) or {}
+    if not isinstance(response_loss_raw, dict):
+        raise ValueError("response_loss must be a mapping when provided")
+    response_loss_kind = str(response_loss_raw.get("kind", "mse"))
+    if response_loss_kind not in {"mse", "smooth_l1", "huber"}:
+        raise ValueError(
+            "response_loss.kind must be 'mse', 'smooth_l1', or 'huber', "
+            f"got {response_loss_kind!r}"
+        )
+    response_loss = ResponseLossSpec(
+        kind=response_loss_kind,
+        smooth_l1_beta=float(response_loss_raw.get("smooth_l1_beta", 0.5)),
+        huber_delta=float(response_loss_raw.get("huber_delta", 1.0)),
+    )
+    if response_loss.smooth_l1_beta <= 0:
+        raise ValueError("response_loss.smooth_l1_beta must be positive")
+    if response_loss.huber_delta <= 0:
+        raise ValueError("response_loss.huber_delta must be positive")
+    dataloader_raw = raw.get("dataloader", {}) or {}
+    if not isinstance(dataloader_raw, dict):
+        raise ValueError("dataloader must be a mapping when provided")
+    num_workers = int(dataloader_raw.get("num_workers", 0))
+    if num_workers < 0:
+        raise ValueError("dataloader.num_workers must be nonnegative")
+    persistent_workers = bool(dataloader_raw.get("persistent_workers", False))
+    if persistent_workers and num_workers == 0:
+        raise ValueError("dataloader.persistent_workers requires num_workers > 0")
+    prefetch_raw = dataloader_raw.get("prefetch_factor", None)
+    prefetch_factor = None if prefetch_raw is None else int(prefetch_raw)
+    if prefetch_factor is not None and prefetch_factor <= 0:
+        raise ValueError("dataloader.prefetch_factor must be positive when set")
+    if prefetch_factor is not None and num_workers == 0:
+        raise ValueError("dataloader.prefetch_factor requires num_workers > 0")
+    dataloader = DataLoaderSpec(
+        num_workers=num_workers,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
+    )
     closure_loss_weights = {
         str(name): float(weight)
         for name, weight in dict(raw.get("closure_loss_weights", {})).items()
         if float(weight) != 0.0
     }
+    size_spectral_loss_weights = {
+        str(name): float(weight)
+        for name, weight in dict(raw.get("size_spectral_loss_weights", {})).items()
+        if float(weight) != 0.0
+    }
+    allowed_size_spectral_losses = {"log_spectrum", "moment", "shape"}
+    unknown_size_spectral_losses = sorted(
+        set(size_spectral_loss_weights) - allowed_size_spectral_losses
+    )
+    if unknown_size_spectral_losses:
+        raise ValueError(
+            "size_spectral_loss_weights contains unsupported losses: "
+            + ", ".join(unknown_size_spectral_losses)
+        )
+    instrument_pretraining = bool(
+        raw.get(
+            "instrument_pretraining",
+            any(
+                str(stage.get("mode", "")) == "instrument_denoise_pretrain"
+                for stage in raw.get("training_stages", ())
+            ),
+        )
+    )
     cross_prediction_selection_mode = str(
         raw.get("cross_prediction_selection_mode", "leave_one_out")
     )
@@ -327,18 +439,24 @@ def load_config(path: str | Path) -> ExperimentConfig:
         decoder_depth=int(raw.get("decoder_depth", 2)),
         transformer_layers=int(raw.get("transformer_layers", 2)),
         transformer_heads=transformer_heads,
+        transformer_ff_multiplier=transformer_ff_multiplier,
+        latent_head_hidden_dim=latent_head_hidden_dim,
         sequence_encoder_type=sequence_encoder_type,
         sequence_fourier_frequencies=int(raw.get("sequence_fourier_frequencies", 6)),
         sequence_transformer_heads=sequence_transformer_heads,
         conditional_ccn_decoder=bool(raw.get("conditional_ccn_decoder", False)),
+        coordinate_decoders=coordinate_decoders,
+        instrument_pretraining=instrument_pretraining,
         sizing_crosstalk_layers=sizing_crosstalk_layers,
         sizing_crosstalk_heads=sizing_crosstalk_heads,
         decoder_expansion_depth=decoder_expansion_depth,
+        decoder_expansion_hidden_dim=decoder_expansion_hidden_dim,
         latent_blocks=latent_blocks,
         block_modality_map=block_modality_map,
         size_grid=size_grid,
         temporal_windows=temporal_windows,
         batch_size=int(raw.get("batch_size", 128)),
+        dataloader=dataloader,
         learning_rate=float(raw.get("learning_rate", 1e-3)),
         learning_rate_schedule=learning_rate_schedule,
         min_learning_rate=float(raw.get("min_learning_rate", 0.0)),
@@ -347,6 +465,8 @@ def load_config(path: str | Path) -> ExperimentConfig:
         latent_l2_weight=float(raw.get("latent_l2_weight", 1e-6)),
         kl_weight=float(raw.get("kl_weight", 0.0)),
         closure_loss_weights=closure_loss_weights,
+        size_spectral_loss_weights=size_spectral_loss_weights,
+        response_loss=response_loss,
         min_feature_coverage=float(raw.get("min_feature_coverage", 0.05)),
         min_feature_std=float(raw.get("min_feature_std", 1e-12)),
         validation_fraction=float(raw.get("validation_fraction", 0.15)),
@@ -380,13 +500,18 @@ def config_to_metadata(config: ExperimentConfig) -> dict[str, Any]:
         "decoder_depth": config.decoder_depth,
         "transformer_layers": config.transformer_layers,
         "transformer_heads": config.transformer_heads,
+        "transformer_ff_multiplier": config.transformer_ff_multiplier,
+        "latent_head_hidden_dim": config.latent_head_hidden_dim,
         "sequence_encoder_type": config.sequence_encoder_type,
         "sequence_fourier_frequencies": config.sequence_fourier_frequencies,
         "sequence_transformer_heads": config.sequence_transformer_heads,
         "conditional_ccn_decoder": config.conditional_ccn_decoder,
+        "coordinate_decoders": dict(config.coordinate_decoders),
+        "instrument_pretraining": config.instrument_pretraining,
         "sizing_crosstalk_layers": config.sizing_crosstalk_layers,
         "sizing_crosstalk_heads": config.sizing_crosstalk_heads,
         "decoder_expansion_depth": config.decoder_expansion_depth,
+        "decoder_expansion_hidden_dim": config.decoder_expansion_hidden_dim,
         "latent_blocks": dict(config.latent_blocks),
         "block_modality_map": {
             block: list(modalities)
@@ -412,6 +537,11 @@ def config_to_metadata(config: ExperimentConfig) -> dict[str, Any]:
             },
         },
         "batch_size": config.batch_size,
+        "dataloader": {
+            "num_workers": config.dataloader.num_workers,
+            "persistent_workers": config.dataloader.persistent_workers,
+            "prefetch_factor": config.dataloader.prefetch_factor,
+        },
         "learning_rate": config.learning_rate,
         "learning_rate_schedule": config.learning_rate_schedule,
         "min_learning_rate": config.min_learning_rate,
@@ -420,6 +550,12 @@ def config_to_metadata(config: ExperimentConfig) -> dict[str, Any]:
         "latent_l2_weight": config.latent_l2_weight,
         "kl_weight": config.kl_weight,
         "closure_loss_weights": dict(config.closure_loss_weights),
+        "size_spectral_loss_weights": dict(config.size_spectral_loss_weights),
+        "response_loss": {
+            "kind": config.response_loss.kind,
+            "smooth_l1_beta": config.response_loss.smooth_l1_beta,
+            "huber_delta": config.response_loss.huber_delta,
+        },
         "min_feature_coverage": config.min_feature_coverage,
         "min_feature_std": config.min_feature_std,
         "validation_fraction": config.validation_fraction,

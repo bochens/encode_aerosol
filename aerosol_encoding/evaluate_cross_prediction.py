@@ -10,7 +10,9 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 from .feature_store import load_feature_store
+from .loss_masks import make_feature_loss_masks
 from .model import build_model_from_checkpoint, unpack_model_output
+from .training_data import load_prepared_arrays
 
 os.environ.setdefault("MPLCONFIGDIR", "/private/tmp/matplotlib")
 os.environ.setdefault("XDG_CACHE_HOME", "/private/tmp")
@@ -19,6 +21,11 @@ os.environ.setdefault("XDG_CACHE_HOME", "/private/tmp")
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate whole-modality cross prediction.")
     parser.add_argument("--features", required=True, help="features.npz from build_features.")
+    parser.add_argument(
+        "--prepared-arrays",
+        default=None,
+        help="Optional prepared arrays cache matching the training run.",
+    )
     parser.add_argument("--checkpoint", required=True, help="Training checkpoint.pt.")
     parser.add_argument("--output", required=True, help="Output directory.")
     parser.add_argument("--split", default="test", choices=["train", "validation", "test", "all"])
@@ -70,6 +77,7 @@ def evaluate_case(
     checkpoint: dict,
     input_modalities: set[str],
     target_modality: str,
+    feature_loss_masks: dict[str, torch.Tensor],
     batch_size: int,
     device: str,
 ) -> dict[str, float]:
@@ -119,6 +127,11 @@ def evaluate_case(
             pred = decoded[target_modality]
             target = x_usable[target_modality]
             mask = mask_usable[target_modality]
+            if target_modality in feature_loss_masks:
+                mask = mask * feature_loss_masks[target_modality].to(
+                    dtype=mask.dtype,
+                    device=mask.device,
+                ).unsqueeze(0)
             se_sum += float((((pred - target) ** 2) * mask).sum().cpu())
             baseline_se_sum += float(((target ** 2) * mask).sum().cpu())
             valid_count += float(mask.sum().cpu())
@@ -222,9 +235,15 @@ def main() -> None:
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
 
-    matrix, _, _ = load_feature_store(args.features)
     checkpoint = torch.load(args.checkpoint, map_location=args.device, weights_only=False)
-    x, feature_mask = normalize_from_checkpoint(matrix, checkpoint)
+    if args.prepared_arrays:
+        arrays = load_prepared_arrays(args.prepared_arrays)
+        x = arrays.x
+        feature_mask = arrays.feature_mask
+    else:
+        matrix, _, _ = load_feature_store(args.features)
+        x, feature_mask = normalize_from_checkpoint(matrix, checkpoint)
+        del matrix
     model = load_model(checkpoint, args.device)
 
     if args.split == "all":
@@ -234,6 +253,15 @@ def main() -> None:
 
     target_modalities = tuple(checkpoint["target_modalities"])
     context_modalities = set(checkpoint.get("context_modalities", ()))
+    feature_loss_masks_np = make_feature_loss_masks(
+        checkpoint["feature_names"],
+        checkpoint["modality_indices"],
+        target_modalities,
+    )
+    feature_loss_masks = {
+        modality: torch.as_tensor(mask, dtype=torch.float32, device=args.device)
+        for modality, mask in feature_loss_masks_np.items()
+    }
     rows = []
     for target in target_modalities:
         inputs = set(checkpoint["modality_indices"]) - {target}
@@ -245,6 +273,7 @@ def main() -> None:
             checkpoint,
             inputs,
             target,
+            feature_loss_masks,
             args.batch_size,
             args.device,
         )
@@ -260,6 +289,7 @@ def main() -> None:
                 checkpoint,
                 unrelated_inputs,
                 target,
+                feature_loss_masks,
                 args.batch_size,
                 args.device,
             )
@@ -287,6 +317,7 @@ def main() -> None:
                 checkpoint,
                 inputs,
                 target,
+                feature_loss_masks,
                 args.batch_size,
                 args.device,
             )

@@ -1,0 +1,134 @@
+checkpoint: artifacts/temporal_gru_30min_20161129_20230421/run_det64_192tok_pretrain_spectral_mps/checkpoint.pt
+model_type: structured_transformer_autoencoder
+latent_dim: 64
+hidden_dim: 192
+global_transformer: layers=3 heads=8
+sizing_crosstalk_transformer: layers=0 heads=4
+decoder_expansion_depth: 4
+
+ARCHITECTURE BLOCKS
+1. Structured encoders produce one hidden_dim token per modality.
+2. SMPS, APS, UHSAS, and OPC tokens go directly into global fusion as separate modality tokens.
+3. The global transformer fuses all visible modality tokens plus one learned latent-query token.
+4. The latent head maps the query output to the deterministic aerosol bottleneck z.
+5. The decoder-expansion block maps z back to hidden_dim before target-specific decoders.
+decoder_expansion_layers: Linear(64 -> 192), GELU, Linear(192 -> 192), GELU, Linear(192 -> 192), GELU, Linear(192 -> 192), LayerNorm
+
+MODALITY SHAPES
+met_context        role=context features= 420 value_mask_input= 840 temporal=30x14
+chemistry_acsm     role=target  features=   7 value_mask_input=  14 temporal=1x7
+size_smps          role=target  features= 450 value_mask_input= 900 temporal=6x75
+size_aps           role=target  features=1980 value_mask_input=3960 temporal=30x66
+size_uhsas         role=target  features=1590 value_mask_input=3180 temporal=30x53
+size_opc           role=target  features=2220 value_mask_input=4440 temporal=30x74
+cpc_number         role=target  features= 240 value_mask_input= 480 temporal=30x8
+ccn_activation     role=target  features= 180 value_mask_input= 360 temporal=30x6
+optical_neph       role=target  features= 810 value_mask_input=1620 temporal=30x27
+
+LAYER SHAPES
+encoders.met_context.temporal_input_projection.0 Linear(37 -> 192) params=7296
+encoders.met_context.temporal_encoder         GRU(input=192, hidden=192, layers=1, batch_first=True) params=222336
+encoders.met_context.temporal_output_norm     LayerNorm((192,)) params=384
+encoders.met_context.coverage_projection      Linear(1 -> 192) params=384
+encoders.met_context.output_norm              LayerNorm((192,)) params=384
+encoders.chemistry_acsm.temporal_input_projection.0 Linear(23 -> 192) params=4608
+encoders.chemistry_acsm.temporal_encoder      GRU(input=192, hidden=192, layers=1, batch_first=True) params=222336
+encoders.chemistry_acsm.temporal_output_norm  LayerNorm((192,)) params=384
+encoders.chemistry_acsm.coverage_projection   Linear(1 -> 192) params=384
+encoders.chemistry_acsm.output_norm           LayerNorm((192,)) params=384
+encoders.size_smps.temporal_input_projection.0 Linear(159 -> 192) params=30720
+encoders.size_smps.temporal_encoder           GRU(input=192, hidden=192, layers=1, batch_first=True) params=222336
+encoders.size_smps.temporal_output_norm       LayerNorm((192,)) params=384
+encoders.size_smps.coverage_projection        Linear(1 -> 192) params=384
+encoders.size_smps.output_norm                LayerNorm((192,)) params=384
+encoders.size_aps.temporal_input_projection.0 Linear(141 -> 192) params=27264
+encoders.size_aps.temporal_encoder            GRU(input=192, hidden=192, layers=1, batch_first=True) params=222336
+encoders.size_aps.temporal_output_norm        LayerNorm((192,)) params=384
+encoders.size_aps.coverage_projection         Linear(1 -> 192) params=384
+encoders.size_aps.output_norm                 LayerNorm((192,)) params=384
+encoders.size_uhsas.temporal_input_projection.0 Linear(115 -> 192) params=22272
+encoders.size_uhsas.temporal_encoder          GRU(input=192, hidden=192, layers=1, batch_first=True) params=222336
+encoders.size_uhsas.temporal_output_norm      LayerNorm((192,)) params=384
+encoders.size_uhsas.coverage_projection       Linear(1 -> 192) params=384
+encoders.size_uhsas.output_norm               LayerNorm((192,)) params=384
+encoders.size_opc.temporal_input_projection.0 Linear(157 -> 192) params=30336
+encoders.size_opc.temporal_encoder            GRU(input=192, hidden=192, layers=1, batch_first=True) params=222336
+encoders.size_opc.temporal_output_norm        LayerNorm((192,)) params=384
+encoders.size_opc.coverage_projection         Linear(1 -> 192) params=384
+encoders.size_opc.output_norm                 LayerNorm((192,)) params=384
+encoders.cpc_number.temporal_input_projection.0 Linear(25 -> 192) params=4992
+encoders.cpc_number.temporal_encoder          GRU(input=192, hidden=192, layers=1, batch_first=True) params=222336
+encoders.cpc_number.temporal_output_norm      LayerNorm((192,)) params=384
+encoders.cpc_number.coverage_projection       Linear(1 -> 192) params=384
+encoders.cpc_number.output_norm               LayerNorm((192,)) params=384
+encoders.ccn_activation.temporal_input_projection.0 Linear(21 -> 192) params=4224
+encoders.ccn_activation.temporal_encoder      GRU(input=192, hidden=192, layers=1, batch_first=True) params=222336
+encoders.ccn_activation.temporal_output_norm  LayerNorm((192,)) params=384
+encoders.ccn_activation.coverage_projection   Linear(1 -> 192) params=384
+encoders.ccn_activation.output_norm           LayerNorm((192,)) params=384
+encoders.optical_neph.temporal_input_projection.0 Linear(63 -> 192) params=12288
+encoders.optical_neph.temporal_encoder        GRU(input=192, hidden=192, layers=1, batch_first=True) params=222336
+encoders.optical_neph.temporal_output_norm    LayerNorm((192,)) params=384
+encoders.optical_neph.coverage_projection     Linear(1 -> 192) params=384
+encoders.optical_neph.output_norm             LayerNorm((192,)) params=384
+transformer.layers.0.self_attn.out_proj       Linear(192 -> 192) params=37056
+transformer.layers.0.linear1                  Linear(192 -> 768) params=148224
+transformer.layers.0.linear2                  Linear(768 -> 192) params=147648
+transformer.layers.0.norm1                    LayerNorm((192,)) params=384
+transformer.layers.0.norm2                    LayerNorm((192,)) params=384
+transformer.layers.1.self_attn.out_proj       Linear(192 -> 192) params=37056
+transformer.layers.1.linear1                  Linear(192 -> 768) params=148224
+transformer.layers.1.linear2                  Linear(768 -> 192) params=147648
+transformer.layers.1.norm1                    LayerNorm((192,)) params=384
+transformer.layers.1.norm2                    LayerNorm((192,)) params=384
+transformer.layers.2.self_attn.out_proj       Linear(192 -> 192) params=37056
+transformer.layers.2.linear1                  Linear(192 -> 768) params=148224
+transformer.layers.2.linear2                  Linear(768 -> 192) params=147648
+transformer.layers.2.norm1                    LayerNorm((192,)) params=384
+transformer.layers.2.norm2                    LayerNorm((192,)) params=384
+transformer.norm                              LayerNorm((192,)) params=384
+latent_head.0                                 LayerNorm((192,)) params=384
+latent_head.1                                 Linear(192 -> 192) params=37056
+latent_head.3                                 Linear(192 -> 64) params=12352
+decoder_expander.0                            Linear(64 -> 192) params=12480
+decoder_expander.2                            Linear(192 -> 192) params=37056
+decoder_expander.4                            Linear(192 -> 192) params=37056
+decoder_expander.6                            Linear(192 -> 192) params=37056
+decoder_expansion_norm                        LayerNorm((192,)) params=384
+decoders.chemistry_acsm.0                     Linear(192 -> 192) params=37056
+decoders.chemistry_acsm.2                     Linear(192 -> 7) params=1351
+decoders.size_smps.0                          Linear(192 -> 192) params=37056
+decoders.size_smps.2                          Linear(192 -> 450) params=86850
+decoders.size_aps.0                           Linear(192 -> 192) params=37056
+decoders.size_aps.2                           Linear(192 -> 1980) params=382140
+decoders.size_uhsas.0                         Linear(192 -> 192) params=37056
+decoders.size_uhsas.2                         Linear(192 -> 1590) params=306870
+decoders.size_opc.0                           Linear(192 -> 192) params=37056
+decoders.size_opc.2                           Linear(192 -> 2220) params=428460
+decoders.cpc_number.0                         Linear(192 -> 192) params=37056
+decoders.cpc_number.2                         Linear(192 -> 240) params=46320
+decoders.ccn_activation.n_ccn_head.0          Linear(432 -> 192) params=83136
+decoders.ccn_activation.n_ccn_head.2          Linear(192 -> 60) params=11580
+decoders.optical_neph.0                       Linear(192 -> 192) params=37056
+decoders.optical_neph.2                       Linear(192 -> 810) params=156330
+pretrain_decoders.met_context.0               Linear(192 -> 192) params=37056
+pretrain_decoders.met_context.2               Linear(192 -> 420) params=81060
+pretrain_decoders.chemistry_acsm.0            Linear(192 -> 192) params=37056
+pretrain_decoders.chemistry_acsm.2            Linear(192 -> 7) params=1351
+pretrain_decoders.size_smps.0                 Linear(192 -> 192) params=37056
+pretrain_decoders.size_smps.2                 Linear(192 -> 450) params=86850
+pretrain_decoders.size_aps.0                  Linear(192 -> 192) params=37056
+pretrain_decoders.size_aps.2                  Linear(192 -> 1980) params=382140
+pretrain_decoders.size_uhsas.0                Linear(192 -> 192) params=37056
+pretrain_decoders.size_uhsas.2                Linear(192 -> 1590) params=306870
+pretrain_decoders.size_opc.0                  Linear(192 -> 192) params=37056
+pretrain_decoders.size_opc.2                  Linear(192 -> 2220) params=428460
+pretrain_decoders.cpc_number.0                Linear(192 -> 192) params=37056
+pretrain_decoders.cpc_number.2                Linear(192 -> 240) params=46320
+pretrain_decoders.ccn_activation.0            Linear(192 -> 192) params=37056
+pretrain_decoders.ccn_activation.2            Linear(192 -> 180) params=34740
+pretrain_decoders.optical_neph.0              Linear(192 -> 192) params=37056
+pretrain_decoders.optical_neph.2              Linear(192 -> 810) params=156330
+
+total_parameters: 7286166
+trainable_parameters: 7286166

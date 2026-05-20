@@ -1,4 +1,4 @@
-data_root: /Volumes/Hailstone Data/DOE_SGP
+data_root: data/DOE_SGP
 freq: 30min
 split_strategy: calendar_month_hash
 feature_coverage_basis: all

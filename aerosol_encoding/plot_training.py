@@ -13,12 +13,12 @@ import pandas as pd
 
 STAGE_LABELS = {
     "deterministic_autoencode_warmup": "autoencode",
-    "denoise_autoencode": "denoise",
-    "mild_masked_hidden_only": "mild mask",
-    "hard_masked_hidden_only": "hard mask",
-    "sizing_crosstalk_single_hidden": "single-size",
-    "leave_one_family_out_hidden_only": "leave-one",
+    "deterministic_denoise_autoencode": "denoise",
+    "mixed_mild_mask": "mild mask",
+    "leave_one_out_hidden_only": "leave-one",
     "leave_one_group_out_hidden_only": "group-out",
+    "continue_leave_one_out_hidden_only": "extra leave-one",
+    "continue_leave_one_group_out_hidden_only": "extra group-out",
 }
 
 
@@ -50,6 +50,8 @@ def main() -> None:
                 history["validation_reconstruction_loss"],
                 label="validation reconstruction",
                 linewidth=2,
+                marker="o",
+                markersize=3.5,
             )
         if "validation_cross_loss" in history:
             axes[0].plot(
@@ -57,6 +59,8 @@ def main() -> None:
                 history["validation_cross_loss"],
                 label="validation selected cross-prediction",
                 linewidth=2,
+                marker="o",
+                markersize=3.5,
             )
             best_col = "validation_cross_loss"
         if "validation_strict_group_out_loss" in history:
@@ -66,6 +70,8 @@ def main() -> None:
                 label="validation strict all-sizing-hidden diagnostic",
                 linewidth=1.5,
                 linestyle="--",
+                marker="s",
+                markersize=3.5,
             )
 
     best_idx = history[best_col].idxmin()
@@ -126,7 +132,14 @@ def main() -> None:
 
     for column in modality_cols:
         label = column.replace("validation_cross_loss_", "").replace("validation_loss_", "")
-        axes[1].plot(history["epoch"], history[column], label=label, linewidth=1.5)
+        axes[1].plot(
+            history["epoch"],
+            history[column],
+            label=label,
+            linewidth=1.25,
+            marker="o",
+            markersize=2.7,
+        )
     axes[1].set_xlabel("epoch")
     axes[1].set_ylabel("validation standardized MSE")
     axes[1].set_yscale("log")

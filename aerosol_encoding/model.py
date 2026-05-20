@@ -198,6 +198,11 @@ def _time_position_features(n_steps: int, fourier_frequencies: int) -> torch.Ten
 DIAMETER_LABEL_RE = re.compile(
     r"^(?P<coordinate>.+)_(?P<value>[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)$"
 )
+DIAMETER_IN_FEATURE_RE = re.compile(
+    r"(?P<coordinate>diameter_mobility|diameter_optical|"
+    r"diameter_aerodynamic|diameter_midpoint|diameter_common_nm)_"
+    r"(?P<value>[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)"
+)
 
 DIAMETER_UNITS = {
     "diameter_mobility": "nm",
@@ -211,8 +216,7 @@ DIAMETER_UNITS = {
 def _diameter_nm_from_feature_name(feature_name: str) -> float | None:
     if "__dN_dlogDp__" not in feature_name:
         return None
-    coordinate_label = feature_name.rsplit("__", maxsplit=1)[-1]
-    match = DIAMETER_LABEL_RE.match(coordinate_label)
+    match = DIAMETER_IN_FEATURE_RE.search(feature_name)
     if match is None:
         return None
     coordinate = match.group("coordinate")
@@ -585,6 +589,453 @@ class ConditionalCCNActivationDecoder(nn.Module):
         return output
 
 
+def _identity_feature_stats(output_dim: int) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.zeros(output_dim, dtype=torch.float32), torch.ones(output_dim, dtype=torch.float32)
+
+
+def _feature_suffix(feature_name: str, variable_name: str) -> str:
+    marker = f"__{variable_name}"
+    if marker not in feature_name:
+        raise ValueError(f"Feature {feature_name!r} does not contain variable {variable_name!r}")
+    return feature_name.split(marker, maxsplit=1)[1]
+
+
+def _variable_indices_by_suffix(
+    feature_names: tuple[str, ...],
+    variable_name: str,
+    *,
+    mean_only: bool = False,
+) -> dict[str, int]:
+    output: dict[str, int] = {}
+    marker = f"__{variable_name}"
+    for index, feature_name in enumerate(feature_names):
+        if marker not in feature_name:
+            continue
+        if mean_only and "__stat_" in feature_name:
+            continue
+        output[_feature_suffix(feature_name, variable_name)] = index
+    return output
+
+
+def _scalar_coordinate_features(values: torch.Tensor, frequencies: int = 4) -> torch.Tensor:
+    if values.ndim in {1, 2}:
+        values = values.unsqueeze(-1)
+    features = [values]
+    for frequency in range(1, frequencies + 1):
+        angle = values * (math.pi * frequency)
+        features.extend([torch.sin(angle), torch.cos(angle)])
+    return torch.cat(features, dim=-1)
+
+
+class CoordinateCCNActivationDecoder(nn.Module):
+    """Predict N_CCN from aerosol latent state queried at supersaturation."""
+
+    def __init__(
+        self,
+        latent_dim: int,
+        hidden_dim: int,
+        output_dim: int,
+        feature_names: tuple[str, ...],
+        depth: int,
+        feature_mean: torch.Tensor | None = None,
+        feature_std: torch.Tensor | None = None,
+        coordinate_frequencies: int = 4,
+    ) -> None:
+        super().__init__()
+        n_ccn_by_suffix = _variable_indices_by_suffix(
+            feature_names,
+            "N_CCN",
+            mean_only=True,
+        )
+        ss_calculated_by_suffix = _variable_indices_by_suffix(
+            feature_names,
+            "supersaturation_calculated",
+            mean_only=True,
+        )
+        ss_setpoint_by_suffix = _variable_indices_by_suffix(
+            feature_names,
+            "supersaturation_set_point",
+            mean_only=True,
+        )
+        if not n_ccn_by_suffix:
+            raise ValueError("Coordinate CCN decoder requires mean N_CCN features")
+
+        n_ccn_indices: list[int] = []
+        ss_calculated_indices: list[int] = []
+        ss_setpoint_indices: list[int] = []
+        for suffix, n_ccn_index in n_ccn_by_suffix.items():
+            calculated_index = ss_calculated_by_suffix.get(suffix)
+            setpoint_index = ss_setpoint_by_suffix.get(suffix)
+            if calculated_index is None and setpoint_index is None:
+                raise ValueError(
+                    "Coordinate CCN decoder could not pair N_CCN feature "
+                    f"{feature_names[n_ccn_index]!r} with a supersaturation coordinate"
+                )
+            n_ccn_indices.append(n_ccn_index)
+            ss_calculated_indices.append(
+                calculated_index if calculated_index is not None else setpoint_index
+            )
+            ss_setpoint_indices.append(
+                setpoint_index if setpoint_index is not None else calculated_index
+            )
+
+        if feature_mean is None or feature_std is None:
+            mean, std = _identity_feature_stats(output_dim)
+        else:
+            mean = feature_mean.detach().to(dtype=torch.float32).clone()
+            std = feature_std.detach().to(dtype=torch.float32).clone()
+
+        coordinate_indices = ss_calculated_indices + ss_setpoint_indices
+        ss_mean = mean[coordinate_indices]
+        ss_std = std[coordinate_indices].clamp_min(1e-6)
+        center = ss_mean.mean()
+        scale = torch.sqrt(((ss_mean - center) ** 2 + ss_std ** 2).mean()).clamp_min(1e-6)
+
+        self.output_dim = output_dim
+        self.coordinate_frequencies = coordinate_frequencies
+        self.register_buffer("feature_mean", mean, persistent=True)
+        self.register_buffer("feature_std", std, persistent=True)
+        self.register_buffer("n_ccn_indices", torch.as_tensor(n_ccn_indices, dtype=torch.long), persistent=False)
+        self.register_buffer(
+            "supersaturation_calculated_indices",
+            torch.as_tensor(ss_calculated_indices, dtype=torch.long),
+            persistent=False,
+        )
+        self.register_buffer(
+            "supersaturation_setpoint_indices",
+            torch.as_tensor(ss_setpoint_indices, dtype=torch.long),
+            persistent=False,
+        )
+        self.register_buffer("ss_center", center.reshape(1), persistent=True)
+        self.register_buffer("ss_scale", scale.reshape(1), persistent=True)
+        coordinate_dim = 1 + 2 * coordinate_frequencies
+        self.response_head = make_mlp(
+            latent_dim + coordinate_dim + 1,
+            hidden_dim,
+            1,
+            depth,
+        )
+
+    def _physical_values(self, normalized: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+        mean = self.feature_mean.index_select(0, indices).to(normalized.device)
+        std = self.feature_std.index_select(0, indices).to(normalized.device)
+        return normalized.index_select(1, indices) * std + mean
+
+    def coordinate_features(self, supersaturation_percent: torch.Tensor) -> torch.Tensor:
+        scaled = (supersaturation_percent - self.ss_center.to(supersaturation_percent.device)) / self.ss_scale.to(supersaturation_percent.device)
+        return _scalar_coordinate_features(scaled, frequencies=self.coordinate_frequencies)
+
+    def forward(
+        self,
+        z: torch.Tensor,
+        target_values: torch.Tensor | None = None,
+        target_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        output = z.new_zeros(z.shape[0], self.output_dim)
+        if target_values is None or target_mask is None:
+            ss_values = z.new_zeros(
+                z.shape[0],
+                self.supersaturation_calculated_indices.numel(),
+            )
+            ss_mask = z.new_zeros(
+                z.shape[0],
+                self.supersaturation_calculated_indices.numel(),
+            )
+        else:
+            calculated_values = self._physical_values(
+                target_values,
+                self.supersaturation_calculated_indices,
+            )
+            calculated_mask = target_mask.index_select(
+                1,
+                self.supersaturation_calculated_indices,
+            ).to(dtype=z.dtype)
+            setpoint_values = self._physical_values(
+                target_values,
+                self.supersaturation_setpoint_indices,
+            )
+            setpoint_mask = target_mask.index_select(
+                1,
+                self.supersaturation_setpoint_indices,
+            ).to(dtype=z.dtype)
+            use_calculated = calculated_mask > 0
+            ss_values = torch.where(use_calculated, calculated_values, setpoint_values)
+            ss_mask = torch.maximum(calculated_mask, setpoint_mask)
+
+        prediction = self.decode_at_supersaturation(z, ss_values, ss_mask)
+        response_mean = self.feature_mean.index_select(0, self.n_ccn_indices).to(z.device)
+        response_std = self.feature_std.index_select(0, self.n_ccn_indices).to(z.device)
+        output[:, self.n_ccn_indices] = (prediction - response_mean) / response_std.clamp_min(1e-6)
+        return output
+
+    def decode_at_supersaturation(
+        self,
+        z: torch.Tensor,
+        supersaturation_percent: torch.Tensor,
+        coordinate_mask: torch.Tensor | None = None,
+        physical: bool = False,
+    ) -> torch.Tensor:
+        if supersaturation_percent.ndim == 0:
+            supersaturation_percent = supersaturation_percent.reshape(1)
+        if supersaturation_percent.ndim == 1:
+            supersaturation_percent = supersaturation_percent.unsqueeze(0).expand(
+                z.shape[0],
+                -1,
+            )
+        if coordinate_mask is None:
+            coordinate_mask = torch.ones_like(supersaturation_percent)
+        coord = self.coordinate_features(supersaturation_percent.to(dtype=z.dtype))
+        query_count = supersaturation_percent.shape[1]
+        z_expanded = z.unsqueeze(1).expand(-1, query_count, -1)
+        query = torch.cat(
+            [z_expanded, coord, coordinate_mask.to(dtype=z.dtype).unsqueeze(-1)],
+            dim=-1,
+        )
+        prediction = self.response_head(query.reshape(-1, query.shape[-1]))
+        transformed = prediction.reshape(z.shape[0], query_count) * coordinate_mask.to(dtype=z.dtype)
+        if physical:
+            return torch.expm1(transformed).clamp_min(0.0)
+        return transformed
+
+
+class CoordinateSizeDistributionDecoder(nn.Module):
+    """Predict one instrument's dN/dlogDp as a queryable function of log-diameter.
+
+    A separate instance is created for SMPS, APS, UHSAS, and OPC. The decoder
+    does not receive an instrument-id coordinate; choosing the module is the
+    instrument-specific routing decision.
+    """
+
+    def __init__(
+        self,
+        latent_dim: int,
+        hidden_dim: int,
+        output_dim: int,
+        feature_names: tuple[str, ...],
+        depth: int,
+        feature_mean: torch.Tensor | None = None,
+        feature_std: torch.Tensor | None = None,
+        coordinate_frequencies: int = 6,
+    ) -> None:
+        super().__init__()
+        spectral: list[tuple[int, float]] = []
+        for index, feature_name in enumerate(feature_names):
+            diameter_nm = _diameter_nm_from_feature_name(feature_name)
+            if diameter_nm is None:
+                continue
+            spectral.append((index, diameter_nm))
+        if not spectral:
+            raise ValueError("Coordinate size decoder requires dN_dlogDp diameter features")
+
+        spectral_indices = [index for index, _ in spectral]
+        diameter_nm = torch.as_tensor([diameter for _, diameter in spectral], dtype=torch.float32)
+        log_dp = torch.log10(diameter_nm)
+        center = 0.5 * (log_dp.max() + log_dp.min())
+        scale = (0.5 * (log_dp.max() - log_dp.min())).clamp_min(1e-6)
+        if feature_mean is None or feature_std is None:
+            mean, std = _identity_feature_stats(output_dim)
+        else:
+            mean = feature_mean.detach().to(dtype=torch.float32).clone()
+            std = feature_std.detach().to(dtype=torch.float32).clone()
+
+        self.output_dim = output_dim
+        self.coordinate_frequencies = coordinate_frequencies
+        self.register_buffer("feature_mean", mean, persistent=True)
+        self.register_buffer("feature_std", std, persistent=True)
+        self.register_buffer("spectral_indices", torch.as_tensor(spectral_indices, dtype=torch.long), persistent=False)
+        self.register_buffer("diameter_nm", diameter_nm, persistent=True)
+        self.register_buffer("log_dp_center", center.reshape(1), persistent=True)
+        self.register_buffer("log_dp_scale", scale.reshape(1), persistent=True)
+        coordinate_dim = 1 + 2 * coordinate_frequencies
+        self.response_head = make_mlp(
+            latent_dim + coordinate_dim,
+            hidden_dim,
+            1,
+            depth,
+        )
+
+    def coordinate_features(self, diameter_nm: torch.Tensor) -> torch.Tensor:
+        log_dp = torch.log10(diameter_nm.clamp_min(1e-6))
+        scaled = (log_dp - self.log_dp_center.to(diameter_nm.device)) / self.log_dp_scale.to(diameter_nm.device)
+        return _scalar_coordinate_features(scaled, frequencies=self.coordinate_frequencies)
+
+    def forward(
+        self,
+        z: torch.Tensor,
+        target_values: torch.Tensor | None = None,
+        target_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        output = z.new_zeros(z.shape[0], self.output_dim)
+        prediction = self.decode_at_diameter(z, self.diameter_nm.to(z.device))
+        response_mean = self.feature_mean.index_select(0, self.spectral_indices).to(z.device)
+        response_std = self.feature_std.index_select(0, self.spectral_indices).to(z.device)
+        output[:, self.spectral_indices] = (prediction - response_mean) / response_std.clamp_min(1e-6)
+        return output
+
+    def decode_at_diameter(
+        self,
+        z: torch.Tensor,
+        diameter_nm: torch.Tensor,
+        physical: bool = False,
+    ) -> torch.Tensor:
+        if diameter_nm.ndim == 0:
+            diameter_nm = diameter_nm.reshape(1)
+        coord = self.coordinate_features(diameter_nm.to(dtype=z.dtype, device=z.device))
+        query_count = coord.shape[0]
+        z_expanded = z.unsqueeze(1).expand(-1, query_count, -1)
+        coord_expanded = coord.unsqueeze(0).expand(z.shape[0], -1, -1)
+        query = torch.cat([z_expanded, coord_expanded], dim=-1)
+        prediction = self.response_head(query.reshape(-1, query.shape[-1]))
+        transformed = prediction.reshape(z.shape[0], query_count)
+        if physical:
+            return torch.expm1(transformed).clamp_min(0.0)
+        return transformed
+
+
+NEPH_CHANNELS = {"B": 0, "G": 1, "R": 2}
+NEPH_KIND = {"Bs": 0, "Bbs": 1}
+NEPH_STATE = {"Dry": 0, "Wet": 1}
+NEPH_RESPONSE_RE = re.compile(r"__(?P<kind>Bbs|Bs)_(?P<channel>[BGR])_(?P<state>Dry|Wet)_Neph3W")
+
+
+class CoordinateNephelometerDecoder(nn.Module):
+    """Predict scattering/backscattering conditioned on RH and channel identity."""
+
+    def __init__(
+        self,
+        latent_dim: int,
+        hidden_dim: int,
+        output_dim: int,
+        feature_names: tuple[str, ...],
+        depth: int,
+        feature_mean: torch.Tensor | None = None,
+        feature_std: torch.Tensor | None = None,
+        coordinate_frequencies: int = 4,
+    ) -> None:
+        super().__init__()
+        if feature_mean is None or feature_std is None:
+            mean, std = _identity_feature_stats(output_dim)
+        else:
+            mean = feature_mean.detach().to(dtype=torch.float32).clone()
+            std = feature_std.detach().to(dtype=torch.float32).clone()
+
+        response_indices: list[int] = []
+        rh_indices: list[int] = []
+        categorical_rows: list[list[float]] = []
+        for index, feature_name in enumerate(feature_names):
+            match = NEPH_RESPONSE_RE.search(feature_name)
+            if match is None:
+                continue
+            variable = match.group(0).removeprefix("__")
+            suffix = _feature_suffix(feature_name, variable)
+            state = match.group("state")
+            rh_variable = f"RH_Neph_{state}"
+            rh_feature = feature_name.replace(variable, rh_variable)
+            if rh_feature not in feature_names:
+                # Same suffix, but robust to stream-specific prefixes.
+                rh_feature = next(
+                    (
+                        candidate
+                        for candidate in feature_names
+                        if f"__{rh_variable}" in candidate
+                        and _feature_suffix(candidate, rh_variable) == suffix
+                    ),
+                    "",
+                )
+            if not rh_feature:
+                raise ValueError(
+                    f"Coordinate nephelometer decoder could not pair {feature_name!r} "
+                    f"with {rh_variable}"
+                )
+            rh_index = feature_names.index(rh_feature)
+            response_indices.append(index)
+            rh_indices.append(rh_index)
+            row = [0.0] * (len(NEPH_CHANNELS) + len(NEPH_KIND) + len(NEPH_STATE))
+            row[NEPH_CHANNELS[match.group("channel")]] = 1.0
+            row[len(NEPH_CHANNELS) + NEPH_KIND[match.group("kind")]] = 1.0
+            row[len(NEPH_CHANNELS) + len(NEPH_KIND) + NEPH_STATE[state]] = 1.0
+            categorical_rows.append(row)
+
+        if not response_indices:
+            raise ValueError("Coordinate nephelometer decoder requires Bs/Bbs response features")
+
+        rh_mean = mean[rh_indices]
+        rh_std = std[rh_indices].clamp_min(1e-6)
+        center = rh_mean.mean()
+        scale = torch.sqrt(((rh_mean - center) ** 2 + rh_std ** 2).mean()).clamp_min(1e-6)
+
+        self.output_dim = output_dim
+        self.coordinate_frequencies = coordinate_frequencies
+        self.register_buffer("feature_mean", mean, persistent=True)
+        self.register_buffer("feature_std", std, persistent=True)
+        self.register_buffer("response_indices", torch.as_tensor(response_indices, dtype=torch.long), persistent=False)
+        self.register_buffer("rh_indices", torch.as_tensor(rh_indices, dtype=torch.long), persistent=False)
+        self.register_buffer("categorical_features", torch.as_tensor(categorical_rows, dtype=torch.float32), persistent=True)
+        self.register_buffer("rh_center", center.reshape(1), persistent=True)
+        self.register_buffer("rh_scale", scale.reshape(1), persistent=True)
+        coordinate_dim = 1 + 2 * coordinate_frequencies
+        categorical_dim = self.categorical_features.shape[1]
+        self.response_head = make_mlp(
+            latent_dim + coordinate_dim + categorical_dim + 1,
+            hidden_dim,
+            1,
+            depth,
+        )
+
+    def _physical_values(self, normalized: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+        mean = self.feature_mean.index_select(0, indices).to(normalized.device)
+        std = self.feature_std.index_select(0, indices).to(normalized.device)
+        return normalized.index_select(1, indices) * std + mean
+
+    def coordinate_features(self, rh_percent: torch.Tensor) -> torch.Tensor:
+        scaled = (rh_percent - self.rh_center.to(rh_percent.device)) / self.rh_scale.to(rh_percent.device)
+        return _scalar_coordinate_features(scaled, frequencies=self.coordinate_frequencies)
+
+    def forward(
+        self,
+        z: torch.Tensor,
+        target_values: torch.Tensor | None = None,
+        target_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        output = z.new_zeros(z.shape[0], self.output_dim)
+        if target_values is None or target_mask is None:
+            rh_values = z.new_zeros(z.shape[0], self.rh_indices.numel())
+            rh_mask = z.new_zeros(z.shape[0], self.rh_indices.numel())
+        else:
+            rh_values = self._physical_values(target_values, self.rh_indices)
+            rh_mask = target_mask.index_select(1, self.rh_indices).to(dtype=z.dtype)
+        prediction = self.decode_at_observed_channels(z, rh_values, rh_mask)
+        response_mean = self.feature_mean.index_select(0, self.response_indices).to(z.device)
+        response_std = self.feature_std.index_select(0, self.response_indices).to(z.device)
+        output[:, self.response_indices] = (prediction - response_mean) / response_std.clamp_min(1e-6)
+        return output
+
+    def decode_at_observed_channels(
+        self,
+        z: torch.Tensor,
+        rh_percent: torch.Tensor,
+        coordinate_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if coordinate_mask is None:
+            coordinate_mask = torch.ones_like(rh_percent)
+        coord = self.coordinate_features(rh_percent.to(dtype=z.dtype))
+        categorical = self.categorical_features.to(dtype=z.dtype, device=z.device)
+        query_count = rh_percent.shape[1]
+        z_expanded = z.unsqueeze(1).expand(-1, query_count, -1)
+        categorical_expanded = categorical.unsqueeze(0).expand(z.shape[0], -1, -1)
+        query = torch.cat(
+            [
+                z_expanded,
+                coord,
+                categorical_expanded,
+                coordinate_mask.to(dtype=z.dtype).unsqueeze(-1),
+            ],
+            dim=-1,
+        )
+        prediction = self.response_head(query.reshape(-1, query.shape[-1]))
+        return prediction.reshape(z.shape[0], query_count) * coordinate_mask.to(dtype=z.dtype)
+
+
 class StructuredTransformerAutoencoder(nn.Module):
     model_type = "structured_transformer_autoencoder"
 
@@ -603,15 +1054,31 @@ class StructuredTransformerAutoencoder(nn.Module):
         sequence_fourier_frequencies: int = 0,
         sequence_transformer_heads: int = 4,
         conditional_ccn_decoder: bool = False,
+        coordinate_decoders: Mapping[str, bool] | None = None,
+        feature_mean_by_modality: Mapping[str, torch.Tensor] | None = None,
+        feature_std_by_modality: Mapping[str, torch.Tensor] | None = None,
+        instrument_pretraining: bool = False,
         sizing_crosstalk_layers: int = 0,
         sizing_crosstalk_heads: int = 4,
         decoder_expansion_depth: int = 0,
+        transformer_ff_multiplier: float = 4.0,
+        latent_head_hidden_dim: int | None = None,
+        decoder_expansion_hidden_dim: int | None = None,
+        legacy_latent_head: bool = False,
     ) -> None:
         super().__init__()
         if sizing_crosstalk_layers < 0:
             raise ValueError("sizing_crosstalk_layers must be nonnegative")
         if decoder_expansion_depth < 0:
             raise ValueError("decoder_expansion_depth must be nonnegative")
+        if transformer_ff_multiplier < 1.0:
+            raise ValueError("transformer_ff_multiplier must be at least 1.0")
+        latent_head_hidden_dim = latent_head_hidden_dim or hidden_dim
+        decoder_expansion_hidden_dim = decoder_expansion_hidden_dim or hidden_dim
+        if latent_head_hidden_dim < latent_dim:
+            raise ValueError("latent_head_hidden_dim must be at least latent_dim")
+        if decoder_expansion_hidden_dim < hidden_dim:
+            raise ValueError("decoder_expansion_hidden_dim must be at least hidden_dim")
         if sizing_crosstalk_layers > 0 and hidden_dim % sizing_crosstalk_heads != 0:
             raise ValueError(
                 "hidden_dim must be divisible by sizing_crosstalk_heads: "
@@ -631,14 +1098,23 @@ class StructuredTransformerAutoencoder(nn.Module):
         self.sequence_fourier_frequencies = sequence_fourier_frequencies
         self.sequence_transformer_heads = sequence_transformer_heads
         self.conditional_ccn_decoder = conditional_ccn_decoder
+        self.coordinate_decoders = dict(coordinate_decoders or {})
+        self.instrument_pretraining = instrument_pretraining
         self.sizing_crosstalk_layers = sizing_crosstalk_layers
         self.sizing_crosstalk_heads = sizing_crosstalk_heads
         self.decoder_expansion_depth = decoder_expansion_depth
+        self.transformer_ff_multiplier = float(transformer_ff_multiplier)
+        self.transformer_ff_dim = int(round(hidden_dim * transformer_ff_multiplier))
+        self.latent_head_hidden_dim = int(latent_head_hidden_dim)
+        self.decoder_expansion_hidden_dim = int(decoder_expansion_hidden_dim)
+        self.legacy_latent_head = bool(legacy_latent_head)
         self.sizing_modalities = tuple(
             name for name in self.modality_names if name in SIZING_MODALITIES
         )
 
         feature_names_by_modality = feature_names_by_modality or {}
+        feature_mean_by_modality = feature_mean_by_modality or {}
+        feature_std_by_modality = feature_std_by_modality or {}
         self.encoders = nn.ModuleDict()
         for name, dim in modality_dims.items():
             names = tuple(feature_names_by_modality.get(name, ()))
@@ -666,7 +1142,7 @@ class StructuredTransformerAutoencoder(nn.Module):
             sizing_layer = nn.TransformerEncoderLayer(
                 d_model=hidden_dim,
                 nhead=sizing_crosstalk_heads,
-                dim_feedforward=hidden_dim * 4,
+                dim_feedforward=self.transformer_ff_dim,
                 dropout=0.05,
                 activation="gelu",
                 batch_first=True,
@@ -684,7 +1160,7 @@ class StructuredTransformerAutoencoder(nn.Module):
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim,
             nhead=transformer_heads,
-            dim_feedforward=hidden_dim * 4,
+            dim_feedforward=self.transformer_ff_dim,
             dropout=0.05,
             activation="gelu",
             batch_first=True,
@@ -696,16 +1172,26 @@ class StructuredTransformerAutoencoder(nn.Module):
             norm=nn.LayerNorm(hidden_dim),
             enable_nested_tensor=False,
         )
-        self.latent_head = nn.Sequential(
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, latent_dim),
-        )
+        if self.legacy_latent_head:
+            self.latent_head = nn.Sequential(
+                nn.LayerNorm(hidden_dim),
+                nn.Linear(hidden_dim, self.latent_head_hidden_dim),
+                nn.GELU(),
+                nn.Linear(self.latent_head_hidden_dim, latent_dim),
+            )
+        else:
+            self.latent_head = nn.Sequential(
+                nn.LayerNorm(hidden_dim),
+                nn.Linear(hidden_dim, self.latent_head_hidden_dim),
+                nn.GELU(),
+                nn.Linear(self.latent_head_hidden_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, latent_dim),
+            )
         if decoder_expansion_depth > 0:
             self.decoder_expander = make_mlp(
                 latent_dim,
-                hidden_dim,
+                self.decoder_expansion_hidden_dim,
                 hidden_dim,
                 decoder_expansion_depth,
             )
@@ -718,12 +1204,45 @@ class StructuredTransformerAutoencoder(nn.Module):
 
         self.decoders = nn.ModuleDict()
         for name in self.target_modalities:
-            if conditional_ccn_decoder and name == "ccn_activation":
+            names = tuple(feature_names_by_modality.get(name, ()))
+            feature_mean = feature_mean_by_modality.get(name)
+            feature_std = feature_std_by_modality.get(name)
+            if self.coordinate_decoders.get("ccn_activation", False) and name == "ccn_activation":
+                self.decoders[name] = CoordinateCCNActivationDecoder(
+                    latent_dim=decoder_input_dim,
+                    hidden_dim=hidden_dim,
+                    output_dim=modality_dims[name],
+                    feature_names=names,
+                    depth=decoder_depth,
+                    feature_mean=feature_mean,
+                    feature_std=feature_std,
+                )
+            elif self.coordinate_decoders.get("size_spectra", False) and name in SIZING_MODALITIES:
+                self.decoders[name] = CoordinateSizeDistributionDecoder(
+                    latent_dim=decoder_input_dim,
+                    hidden_dim=hidden_dim,
+                    output_dim=modality_dims[name],
+                    feature_names=names,
+                    depth=decoder_depth,
+                    feature_mean=feature_mean,
+                    feature_std=feature_std,
+                )
+            elif self.coordinate_decoders.get("optical_neph", False) and name == "optical_neph":
+                self.decoders[name] = CoordinateNephelometerDecoder(
+                    latent_dim=decoder_input_dim,
+                    hidden_dim=hidden_dim,
+                    output_dim=modality_dims[name],
+                    feature_names=names,
+                    depth=decoder_depth,
+                    feature_mean=feature_mean,
+                    feature_std=feature_std,
+                )
+            elif conditional_ccn_decoder and name == "ccn_activation":
                 self.decoders[name] = ConditionalCCNActivationDecoder(
                     latent_dim=decoder_input_dim,
                     hidden_dim=hidden_dim,
                     output_dim=modality_dims[name],
-                    feature_names=tuple(feature_names_by_modality.get(name, ())),
+                    feature_names=names,
                     depth=decoder_depth,
                 )
             else:
@@ -733,6 +1252,16 @@ class StructuredTransformerAutoencoder(nn.Module):
                     modality_dims[name],
                     decoder_depth,
                 )
+        self.pretrain_decoders = (
+            nn.ModuleDict(
+                {
+                    name: make_mlp(hidden_dim, hidden_dim, dim, decoder_depth)
+                    for name, dim in modality_dims.items()
+                }
+            )
+            if instrument_pretraining
+            else None
+        )
 
     def _modality_tokens(
         self,
@@ -835,17 +1364,37 @@ class StructuredTransformerAutoencoder(nn.Module):
             )
         )
 
+    def pretrain_decode_modalities(
+        self,
+        x_by_modality: Mapping[str, torch.Tensor],
+        feature_mask_by_modality: Mapping[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        if self.pretrain_decoders is None:
+            raise RuntimeError("instrument pretraining decoders are disabled for this model")
+        tokens = self._modality_tokens(x_by_modality, feature_mask_by_modality)
+        return {
+            name: self.pretrain_decoders[name](tokens[name])
+            for name in self.modality_names
+        }
+
     def _decode_targets(
         self,
         z: torch.Tensor,
         x_by_modality: Mapping[str, torch.Tensor],
         feature_mask_by_modality: Mapping[str, torch.Tensor],
     ) -> dict[str, torch.Tensor]:
-        decoder_input = self.decoder_expansion_norm(self.decoder_expander(z))
+        decoder_input = self.decoder_state(z)
         decoded: dict[str, torch.Tensor] = {}
         for name in self.target_modalities:
             decoder = self.decoders[name]
-            if isinstance(decoder, ConditionalCCNActivationDecoder):
+            if isinstance(
+                decoder,
+                (
+                    ConditionalCCNActivationDecoder,
+                    CoordinateCCNActivationDecoder,
+                    CoordinateNephelometerDecoder,
+                ),
+            ):
                 decoded[name] = decoder(
                     decoder_input,
                     x_by_modality.get(name),
@@ -854,6 +1403,49 @@ class StructuredTransformerAutoencoder(nn.Module):
             else:
                 decoded[name] = decoder(decoder_input)
         return decoded
+
+    def decoder_state(self, z: torch.Tensor) -> torch.Tensor:
+        return self.decoder_expansion_norm(self.decoder_expander(z))
+
+    def decode_ccn_at_supersaturation(
+        self,
+        z: torch.Tensor,
+        supersaturation_percent: torch.Tensor,
+        physical: bool = True,
+    ) -> torch.Tensor:
+        decoder = (
+            self.decoders["ccn_activation"]
+            if "ccn_activation" in self.decoders
+            else None
+        )
+        if not isinstance(decoder, CoordinateCCNActivationDecoder):
+            raise TypeError("ccn_activation is not using CoordinateCCNActivationDecoder")
+        return decoder.decode_at_supersaturation(
+            self.decoder_state(z),
+            supersaturation_percent,
+            physical=physical,
+        )
+
+    def decode_size_at_diameter(
+        self,
+        z: torch.Tensor,
+        modality: str,
+        diameter_nm: torch.Tensor,
+        physical: bool = True,
+    ) -> torch.Tensor:
+        """Query a specific sizing decoder at one or more diameters.
+
+        The `modality` argument chooses a separate decoder head, for example
+        `size_smps` or `size_aps`. It is not embedded as a coordinate.
+        """
+        decoder = self.decoders[modality] if modality in self.decoders else None
+        if not isinstance(decoder, CoordinateSizeDistributionDecoder):
+            raise TypeError(f"{modality} is not using CoordinateSizeDistributionDecoder")
+        return decoder.decode_at_diameter(
+            self.decoder_state(z),
+            diameter_nm,
+            physical=physical,
+        )
 
     def forward(
         self,
@@ -881,7 +1473,9 @@ class StructuredTransformerVAE(StructuredTransformerAutoencoder):
         super().__init__(*args, **kwargs)
         self.latent_head = nn.Sequential(
             nn.LayerNorm(self.hidden_dim),
-            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.Linear(self.hidden_dim, self.latent_head_hidden_dim),
+            nn.GELU(),
+            nn.Linear(self.latent_head_hidden_dim, self.hidden_dim),
             nn.GELU(),
             nn.Linear(self.hidden_dim, self.latent_dim * 2),
         )
@@ -1257,7 +1851,14 @@ class StructuredHierarchicalPoETransformerVAE(nn.Module):
         decoded: dict[str, torch.Tensor] = {}
         for name in self.target_modalities:
             decoder = self.decoders[name]
-            if isinstance(decoder, ConditionalCCNActivationDecoder):
+            if isinstance(
+                decoder,
+                (
+                    ConditionalCCNActivationDecoder,
+                    CoordinateCCNActivationDecoder,
+                    CoordinateNephelometerDecoder,
+                ),
+            ):
                 decoded[name] = decoder(
                     decode_z,
                     x_by_modality.get(name),
@@ -1357,9 +1958,17 @@ def build_aerosol_model(
     sequence_fourier_frequencies: int = 0,
     sequence_transformer_heads: int = 4,
     conditional_ccn_decoder: bool = False,
+    coordinate_decoders: Mapping[str, bool] | None = None,
+    feature_mean_by_modality_map: Mapping[str, torch.Tensor] | None = None,
+    feature_std_by_modality_map: Mapping[str, torch.Tensor] | None = None,
+    instrument_pretraining: bool = False,
     sizing_crosstalk_layers: int = 0,
     sizing_crosstalk_heads: int = 4,
     decoder_expansion_depth: int = 0,
+    transformer_ff_multiplier: float = 4.0,
+    latent_head_hidden_dim: int | None = None,
+    decoder_expansion_hidden_dim: int | None = None,
+    legacy_latent_head: bool = False,
 ) -> nn.Module:
     if model_type in {"grouped_masked_autoencoder", "grouped_autoencoder"}:
         return GroupedMaskedAutoencoder(
@@ -1402,9 +2011,17 @@ def build_aerosol_model(
             sequence_fourier_frequencies=sequence_fourier_frequencies,
             sequence_transformer_heads=sequence_transformer_heads,
             conditional_ccn_decoder=conditional_ccn_decoder,
+            coordinate_decoders=coordinate_decoders,
+            feature_mean_by_modality=feature_mean_by_modality_map,
+            feature_std_by_modality=feature_std_by_modality_map,
+            instrument_pretraining=instrument_pretraining,
             sizing_crosstalk_layers=sizing_crosstalk_layers,
             sizing_crosstalk_heads=sizing_crosstalk_heads,
             decoder_expansion_depth=decoder_expansion_depth,
+            transformer_ff_multiplier=transformer_ff_multiplier,
+            latent_head_hidden_dim=latent_head_hidden_dim,
+            decoder_expansion_hidden_dim=decoder_expansion_hidden_dim,
+            legacy_latent_head=legacy_latent_head,
         )
     if model_type == "structured_transformer_vae":
         return StructuredTransformerVAE(
@@ -1421,9 +2038,17 @@ def build_aerosol_model(
             sequence_fourier_frequencies=sequence_fourier_frequencies,
             sequence_transformer_heads=sequence_transformer_heads,
             conditional_ccn_decoder=conditional_ccn_decoder,
+            coordinate_decoders=coordinate_decoders,
+            feature_mean_by_modality=feature_mean_by_modality_map,
+            feature_std_by_modality=feature_std_by_modality_map,
+            instrument_pretraining=instrument_pretraining,
             sizing_crosstalk_layers=sizing_crosstalk_layers,
             sizing_crosstalk_heads=sizing_crosstalk_heads,
             decoder_expansion_depth=decoder_expansion_depth,
+            transformer_ff_multiplier=transformer_ff_multiplier,
+            latent_head_hidden_dim=latent_head_hidden_dim,
+            decoder_expansion_hidden_dim=decoder_expansion_hidden_dim,
+            legacy_latent_head=legacy_latent_head,
         )
     raise ValueError(f"Unknown model_type: {model_type}")
 
@@ -1433,6 +2058,31 @@ def build_model_from_checkpoint(checkpoint: Mapping[str, Any]) -> nn.Module:
     model_type = str(checkpoint.get("model_type", config.get("model_type", "grouped_masked_autoencoder")))
     modality_indices = checkpoint.get("modality_indices", {})
     feature_names = checkpoint.get("feature_names", ())
+    mean = checkpoint.get("mean")
+    std = checkpoint.get("std")
+    feature_mean_by_modality_map = None
+    feature_std_by_modality_map = None
+    if mean is not None and std is not None:
+        mean_tensor = torch.as_tensor(mean, dtype=torch.float32)
+        std_tensor = torch.as_tensor(std, dtype=torch.float32)
+        feature_mean_by_modality_map = {
+            modality: mean_tensor[indices]
+            for modality, indices in modality_indices.items()
+        }
+        feature_std_by_modality_map = {
+            modality: std_tensor[indices]
+            for modality, indices in modality_indices.items()
+        }
+    model_state = checkpoint.get("model_state", {})
+    legacy_latent_head = bool(checkpoint.get("legacy_latent_head", False))
+    if (
+        model_type == "structured_transformer_autoencoder"
+        and "latent_head.5.weight" not in model_state
+        and "latent_head.3.weight" in model_state
+    ):
+        legacy_latent_head = tuple(model_state["latent_head.3.weight"].shape)[0] == int(
+            checkpoint["latent_dim"]
+        )
     return build_aerosol_model(
         model_type=model_type,
         modality_dims=checkpoint["modality_dims"],
@@ -1445,6 +2095,18 @@ def build_model_from_checkpoint(checkpoint: Mapping[str, Any]) -> nn.Module:
         latent_blocks=checkpoint.get("latent_blocks", config.get("latent_blocks")),
         transformer_layers=int(config.get("transformer_layers", checkpoint.get("transformer_layers", 2))),
         transformer_heads=int(config.get("transformer_heads", checkpoint.get("transformer_heads", 4))),
+        transformer_ff_multiplier=float(
+            config.get(
+                "transformer_ff_multiplier",
+                checkpoint.get("transformer_ff_multiplier", 4.0),
+            )
+        ),
+        latent_head_hidden_dim=int(
+            config.get(
+                "latent_head_hidden_dim",
+                checkpoint.get("latent_head_hidden_dim", checkpoint.get("hidden_dim", 128)),
+            )
+        ),
         block_modality_map=checkpoint.get("block_modality_map", config.get("block_modality_map")),
         sequence_encoder_type=str(config.get("sequence_encoder_type", checkpoint.get("sequence_encoder_type", "conv"))),
         sequence_fourier_frequencies=int(
@@ -1458,6 +2120,14 @@ def build_model_from_checkpoint(checkpoint: Mapping[str, Any]) -> nn.Module:
         ),
         conditional_ccn_decoder=bool(
             config.get("conditional_ccn_decoder", checkpoint.get("conditional_ccn_decoder", False))
+        ),
+        coordinate_decoders=dict(
+            config.get("coordinate_decoders", checkpoint.get("coordinate_decoders", {}))
+        ),
+        feature_mean_by_modality_map=feature_mean_by_modality_map,
+        feature_std_by_modality_map=feature_std_by_modality_map,
+        instrument_pretraining=bool(
+            config.get("instrument_pretraining", checkpoint.get("instrument_pretraining", False))
         ),
         sizing_crosstalk_layers=int(
             config.get(
@@ -1480,4 +2150,11 @@ def build_model_from_checkpoint(checkpoint: Mapping[str, Any]) -> nn.Module:
                 checkpoint.get("decoder_expansion_depth", 0),
             )
         ),
+        decoder_expansion_hidden_dim=int(
+            config.get(
+                "decoder_expansion_hidden_dim",
+                checkpoint.get("decoder_expansion_hidden_dim", checkpoint.get("hidden_dim", 128)),
+            )
+        ),
+        legacy_latent_head=legacy_latent_head,
     )

@@ -4,24 +4,32 @@ import argparse
 import csv
 import json
 import math
+import time
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from .closure import AerosolClosureLosses
+from .closure import AerosolClosureLosses, AerosolSizeSpectralLosses
 from .config import config_to_metadata, load_config
 from .feature_store import load_feature_store
+from .loss_masks import make_feature_loss_masks
 from .model import build_aerosol_model, feature_names_by_modality, unpack_model_output
-from .training_data import AerosolDataset, PreparedArrays, prepare_arrays
+from .training_data import AerosolDataset, PreparedArrays, load_prepared_arrays, prepare_arrays
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train grouped masked aerosol autoencoder.")
     parser.add_argument("--config", required=True, help="Experiment YAML config.")
     parser.add_argument("--features", required=True, help="features.npz from build_features.")
+    parser.add_argument(
+        "--prepared-arrays",
+        default=None,
+        help="Optional prepared arrays cache produced by prepare_training_arrays.",
+    )
     parser.add_argument("--output", required=True, help="Run output directory.")
     parser.add_argument("--epochs", type=int, default=None, help="Training epochs.")
     parser.add_argument(
@@ -39,8 +47,9 @@ def parse_args() -> argparse.Namespace:
         "--resume-with-fresh-optimizer",
         action="store_true",
         help=(
-            "Resume legacy checkpoints that lack optimizer/scheduler state by "
-            "restoring model weights and history, then initializing a fresh optimizer."
+            "Restore model weights and history from a checkpoint, but initialize "
+            "a fresh optimizer and scheduler. Use this for intentional continuation "
+            "runs after the previous learning-rate schedule has ended."
         ),
     )
     parser.add_argument("--device", default="cpu", help="Torch device.")
@@ -202,13 +211,22 @@ def masked_loss(
     x_by_modality: dict[str, torch.Tensor],
     mask_by_modality: dict[str, torch.Tensor],
     target_modalities: tuple[str, ...],
+    feature_loss_masks: dict[str, torch.Tensor] | None = None,
     loss_row_masks: dict[str, torch.Tensor] | None = None,
+    response_loss_kind: str = "mse",
+    smooth_l1_beta: float = 0.5,
+    huber_delta: float = 1.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     losses: list[torch.Tensor] = []
     metrics: dict[str, float] = {}
     for modality in target_modalities:
         target = x_by_modality[modality]
         mask = mask_by_modality[modality]
+        if feature_loss_masks is not None and modality in feature_loss_masks:
+            mask = mask * feature_loss_masks[modality].to(
+                dtype=mask.dtype,
+                device=mask.device,
+            ).unsqueeze(0)
         if loss_row_masks is not None:
             row_mask = loss_row_masks.get(modality)
             if row_mask is not None:
@@ -216,7 +234,25 @@ def masked_loss(
         valid = mask.sum()
         if valid <= 0:
             continue
-        loss = (((decoded[modality] - target) ** 2) * mask).sum() / valid
+        if response_loss_kind == "mse":
+            element_loss = (decoded[modality] - target) ** 2
+        elif response_loss_kind == "smooth_l1":
+            element_loss = F.smooth_l1_loss(
+                decoded[modality],
+                target,
+                beta=smooth_l1_beta,
+                reduction="none",
+            )
+        elif response_loss_kind == "huber":
+            element_loss = F.huber_loss(
+                decoded[modality],
+                target,
+                delta=huber_delta,
+                reduction="none",
+            )
+        else:
+            raise ValueError(f"Unknown response_loss_kind: {response_loss_kind}")
+        loss = (element_loss * mask).sum() / valid
         losses.append(loss)
         metrics[f"loss_{modality}"] = float(loss.detach().cpu())
 
@@ -224,6 +260,58 @@ def masked_loss(
         raise RuntimeError("Batch has no finite target values")
     total = torch.stack(losses).mean()
     metrics["loss"] = float(total.detach().cpu())
+    return total, metrics
+
+
+def modality_pretrain_loss(
+    decoded: dict[str, torch.Tensor],
+    x_by_modality: dict[str, torch.Tensor],
+    mask_by_modality: dict[str, torch.Tensor],
+    feature_loss_masks: dict[str, torch.Tensor] | None = None,
+    response_loss_kind: str = "mse",
+    smooth_l1_beta: float = 0.5,
+    huber_delta: float = 1.0,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    losses: list[torch.Tensor] = []
+    metrics: dict[str, float] = {}
+    for modality, prediction in decoded.items():
+        target = x_by_modality[modality]
+        mask = mask_by_modality[modality]
+        if feature_loss_masks is not None and modality in feature_loss_masks:
+            mask = mask * feature_loss_masks[modality].to(
+                dtype=mask.dtype,
+                device=mask.device,
+            ).unsqueeze(0)
+        valid = mask.sum()
+        if valid <= 0:
+            continue
+        if response_loss_kind == "mse":
+            element_loss = (prediction - target) ** 2
+        elif response_loss_kind == "smooth_l1":
+            element_loss = F.smooth_l1_loss(
+                prediction,
+                target,
+                beta=smooth_l1_beta,
+                reduction="none",
+            )
+        elif response_loss_kind == "huber":
+            element_loss = F.huber_loss(
+                prediction,
+                target,
+                delta=huber_delta,
+                reduction="none",
+            )
+        else:
+            raise ValueError(f"Unknown response_loss_kind: {response_loss_kind}")
+        loss = (element_loss * mask).sum() / valid
+        losses.append(loss)
+        metrics[f"pretrain_loss_{modality}"] = float(loss.detach().cpu())
+
+    if not losses:
+        raise RuntimeError("Batch has no finite modality pretraining values")
+    total = torch.stack(losses).mean()
+    metrics["loss"] = float(total.detach().cpu())
+    metrics["modality_pretrain_loss"] = metrics["loss"]
     return total, metrics
 
 
@@ -250,14 +338,19 @@ def run_epoch(
     target_modalities: tuple[str, ...],
     always_input_modalities: tuple[str, ...],
     cross_prediction_exclusion_groups: tuple[tuple[str, ...], ...],
+    feature_loss_masks: dict[str, torch.Tensor] | None,
     stage_mode: str,
     loss_mode: str,
     mask_probability: float,
     feature_dropout_probability: float,
     feature_noise_std: float,
+    response_loss_kind: str,
+    smooth_l1_beta: float,
+    huber_delta: float,
     latent_l2_weight: float,
     kl_weight: float,
     closure_losses: AerosolClosureLosses | None,
+    size_spectral_losses: AerosolSizeSpectralLosses | None,
     device: torch.device,
     optimizer: torch.optim.Optimizer | None,
 ) -> dict[str, float]:
@@ -279,8 +372,38 @@ def run_epoch(
             feature_noise_std=feature_noise_std,
             training=training,
         )
+        if stage_mode == "instrument_denoise_pretrain":
+            if not hasattr(model, "pretrain_decode_modalities"):
+                raise ValueError(
+                    f"Model {type(model).__name__} does not support instrument_denoise_pretrain"
+                )
+            with torch.set_grad_enabled(training):
+                decoded = model.pretrain_decode_modalities(  # type: ignore[attr-defined]
+                    input_x_by_modality,
+                    input_mask_by_modality,
+                )
+                loss, metrics = modality_pretrain_loss(
+                    decoded,
+                    x_by_modality,
+                    mask_by_modality,
+                    feature_loss_masks=feature_loss_masks,
+                    response_loss_kind=response_loss_kind,
+                    smooth_l1_beta=smooth_l1_beta,
+                    huber_delta=huber_delta,
+                )
+                if training:
+                    optimizer.zero_grad(set_to_none=True)
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+                    optimizer.step()
+
+            batch_n = batch_x.shape[0]
+            count += batch_n
+            for key, value in metrics.items():
+                sums[key] = sums.get(key, 0.0) + value * batch_n
+            continue
         input_mask = make_input_modality_mask(
-            input_mask_by_modality,
+            mask_by_modality,
             target_modalities=target_modalities,
             always_input_modalities=always_input_modalities,
             cross_prediction_exclusion_groups=cross_prediction_exclusion_groups,
@@ -303,7 +426,11 @@ def run_epoch(
                 x_by_modality,
                 mask_by_modality,
                 target_modalities,
+                feature_loss_masks=feature_loss_masks,
                 loss_row_masks=loss_row_masks,
+                response_loss_kind=response_loss_kind,
+                smooth_l1_beta=smooth_l1_beta,
+                huber_delta=huber_delta,
             )
             if loss_mode == "hidden_only":
                 metrics["hidden_target_loss"] = metrics["loss"]
@@ -329,6 +456,19 @@ def run_epoch(
                 for key, value in closure_metrics.items():
                     raw_name = key.removeprefix("closure_")
                     weight = closure_losses.weights[raw_name]
+                    loss = loss + weight * value
+                    metrics[key] = float(value.detach().cpu())
+                    metrics[f"{key}_weighted"] = float((weight * value).detach().cpu())
+            if size_spectral_losses is not None and size_spectral_losses.enabled:
+                spectral_metrics = size_spectral_losses(
+                    decoded,
+                    x_by_modality,
+                    mask_by_modality,
+                    loss_row_masks=loss_row_masks,
+                )
+                for key, value in spectral_metrics.items():
+                    raw_name = key.removeprefix("size_spectral_")
+                    weight = size_spectral_losses.weights[raw_name]
                     loss = loss + weight * value
                     metrics[key] = float(value.detach().cpu())
                     metrics[f"{key}_weighted"] = float((weight * value).detach().cpu())
@@ -365,6 +505,7 @@ def run_cross_prediction_epoch(
     target_modalities: tuple[str, ...],
     always_input_modalities: tuple[str, ...],
     cross_prediction_exclusion_groups: tuple[tuple[str, ...], ...],
+    feature_loss_masks: dict[str, torch.Tensor] | None,
     stage_mode: str,
     device: torch.device,
 ) -> dict[str, float]:
@@ -429,6 +570,11 @@ def run_cross_prediction_epoch(
                     model(case_x_by_modality, case_mask_by_modality, case_input_mask)
                 )
                 effective_mask = case_mask_by_modality[target]
+                if feature_loss_masks is not None and target in feature_loss_masks:
+                    effective_mask = effective_mask * feature_loss_masks[target].to(
+                        dtype=effective_mask.dtype,
+                        device=effective_mask.device,
+                    ).unsqueeze(0)
                 valid = effective_mask.sum()
                 if valid <= 0:
                     continue
@@ -458,7 +604,7 @@ def build_training_stages(
     config,
     cli_epochs: int | None,
     max_epochs: int | None = None,
-) -> list[dict[str, float | int | str]]:
+) -> list[dict[str, Any]]:
     if cli_epochs is not None:
         if max_epochs is not None:
             raise ValueError("--epochs and --max-epochs cannot be used together")
@@ -491,7 +637,7 @@ def build_training_stages(
         return stages
     if max_epochs <= 0:
         raise ValueError("--max-epochs must be positive")
-    truncated: list[dict[str, float | int | str]] = []
+    truncated: list[dict[str, Any]] = []
     remaining = int(max_epochs)
     for stage in stages:
         stage_epochs = int(stage.get("epochs", 1))
@@ -502,6 +648,30 @@ def build_training_stages(
         truncated.append(clipped)
         remaining -= int(clipped["epochs"])
     return truncated
+
+
+def stage_modalities(
+    stage: dict[str, Any],
+    key: str,
+    default_modalities: tuple[str, ...],
+    all_target_modalities: tuple[str, ...],
+) -> tuple[str, ...]:
+    raw = stage.get(key)
+    if raw is None:
+        return default_modalities
+    if isinstance(raw, str):
+        selected = (raw,)
+    else:
+        selected = tuple(str(item) for item in raw)
+    if not selected:
+        raise ValueError(f"Stage {stage.get('name', 'stage')!r} has empty {key}")
+    unknown = sorted(set(selected) - set(all_target_modalities))
+    if unknown:
+        raise ValueError(
+            f"Stage {stage.get('name', 'stage')!r} {key} contains non-target modalities: "
+            + ", ".join(unknown)
+        )
+    return selected
 
 
 def checkpoint_payload(
@@ -516,6 +686,7 @@ def checkpoint_payload(
     scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
     global_epoch: int | None = None,
     best_validation: float | None = None,
+    stage_best_validations: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     modality_dims = {
         modality: len(indices)
@@ -542,14 +713,28 @@ def checkpoint_payload(
         "latent_blocks": getattr(model, "latent_blocks", {}),
         "transformer_layers": getattr(model, "transformer_layers", None),
         "transformer_heads": getattr(model, "transformer_heads", None),
+        "transformer_ff_multiplier": getattr(model, "transformer_ff_multiplier", None),
+        "transformer_ff_dim": getattr(model, "transformer_ff_dim", None),
+        "latent_head_hidden_dim": getattr(model, "latent_head_hidden_dim", None),
         "block_modality_map": getattr(model, "block_modality_map", {}),
         "sequence_encoder_type": getattr(model, "sequence_encoder_type", None),
         "sequence_fourier_frequencies": getattr(model, "sequence_fourier_frequencies", None),
         "sequence_transformer_heads": getattr(model, "sequence_transformer_heads", None),
         "conditional_ccn_decoder": getattr(model, "conditional_ccn_decoder", False),
+        "instrument_pretraining": getattr(model, "instrument_pretraining", False),
         "sizing_crosstalk_layers": getattr(model, "sizing_crosstalk_layers", 0),
         "sizing_crosstalk_heads": getattr(model, "sizing_crosstalk_heads", None),
         "decoder_expansion_depth": getattr(model, "decoder_expansion_depth", 0),
+        "decoder_expansion_hidden_dim": getattr(model, "decoder_expansion_hidden_dim", None),
+        "coordinate_decoders": getattr(model, "coordinate_decoders", {}),
+        "feature_loss_masks": {
+            modality: mask.tolist()
+            for modality, mask in make_feature_loss_masks(
+                arrays.feature_names,
+                arrays.modality_indices,
+                target_modalities,
+            ).items()
+        },
     }
     if optimizer is not None:
         payload["optimizer_state"] = optimizer.state_dict()
@@ -559,6 +744,11 @@ def checkpoint_payload(
         payload["global_epoch"] = int(global_epoch)
     if best_validation is not None:
         payload["best_validation"] = float(best_validation)
+    if stage_best_validations is not None:
+        payload["stage_best_validations"] = {
+            str(key): float(value)
+            for key, value in stage_best_validations.items()
+        }
     return payload
 
 
@@ -633,21 +823,35 @@ def set_cosine_scheduler_epoch(
     scheduler._last_lr = [group["lr"] for group in optimizer.param_groups]
 
 
+def dataloader_kwargs(config) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "num_workers": config.dataloader.num_workers,
+        "persistent_workers": config.dataloader.persistent_workers,
+    }
+    if config.dataloader.prefetch_factor is not None:
+        kwargs["prefetch_factor"] = config.dataloader.prefetch_factor
+    return kwargs
+
+
 def main() -> None:
     args = parse_args()
     config = load_config(args.config)
-    matrix, times, metadata = load_feature_store(args.features)
-    arrays = prepare_arrays(
-        matrix=matrix,
-        times=times,
-        metadata=metadata,
-        min_feature_coverage=config.min_feature_coverage,
-        min_feature_std=config.min_feature_std,
-        validation_fraction=config.validation_fraction,
-        test_fraction=config.test_fraction,
-        split_strategy=config.split_strategy,
-        feature_coverage_basis=config.feature_coverage_basis,
-    )
+    if args.prepared_arrays:
+        arrays = load_prepared_arrays(args.prepared_arrays)
+    else:
+        matrix, times, metadata = load_feature_store(args.features)
+        arrays = prepare_arrays(
+            matrix=matrix,
+            times=times,
+            metadata=metadata,
+            min_feature_coverage=config.min_feature_coverage,
+            min_feature_std=config.min_feature_std,
+            validation_fraction=config.validation_fraction,
+            test_fraction=config.test_fraction,
+            split_strategy=config.split_strategy,
+            feature_coverage_basis=config.feature_coverage_basis,
+        )
+        del matrix, times, metadata
 
     target_modalities = tuple(
         modality
@@ -673,6 +877,23 @@ def main() -> None:
     np.random.seed(config.seed)
     device = torch.device(args.device)
     feature_name_map = feature_names_by_modality(arrays.feature_names, arrays.modality_indices)
+    feature_loss_masks_np = make_feature_loss_masks(
+        arrays.feature_names,
+        arrays.modality_indices,
+        target_modalities,
+    )
+    feature_loss_masks = {
+        modality: torch.as_tensor(mask, dtype=torch.float32, device=device)
+        for modality, mask in feature_loss_masks_np.items()
+    }
+    feature_mean_by_modality = {
+        modality: torch.as_tensor(arrays.mean[indices], dtype=torch.float32)
+        for modality, indices in arrays.modality_indices.items()
+    }
+    feature_std_by_modality = {
+        modality: torch.as_tensor(arrays.std[indices], dtype=torch.float32)
+        for modality, indices in arrays.modality_indices.items()
+    }
     model = build_aerosol_model(
         model_type=config.model_type,
         modality_dims=modality_dims,
@@ -685,14 +906,21 @@ def main() -> None:
         latent_blocks=config.latent_blocks,
         transformer_layers=config.transformer_layers,
         transformer_heads=config.transformer_heads,
+        transformer_ff_multiplier=config.transformer_ff_multiplier,
+        latent_head_hidden_dim=config.latent_head_hidden_dim,
         block_modality_map=config.block_modality_map,
         sequence_encoder_type=config.sequence_encoder_type,
         sequence_fourier_frequencies=config.sequence_fourier_frequencies,
         sequence_transformer_heads=config.sequence_transformer_heads,
         conditional_ccn_decoder=config.conditional_ccn_decoder,
+        coordinate_decoders=config.coordinate_decoders,
+        feature_mean_by_modality_map=feature_mean_by_modality,
+        feature_std_by_modality_map=feature_std_by_modality,
+        instrument_pretraining=config.instrument_pretraining,
         sizing_crosstalk_layers=config.sizing_crosstalk_layers,
         sizing_crosstalk_heads=config.sizing_crosstalk_heads,
         decoder_expansion_depth=config.decoder_expansion_depth,
+        decoder_expansion_hidden_dim=config.decoder_expansion_hidden_dim,
     ).to(device)
     config_metadata = config_to_metadata(config)
     mean_by_modality = {
@@ -709,8 +937,24 @@ def main() -> None:
             mean_by_modality=mean_by_modality,
             std_by_modality=std_by_modality,
             weights=config.closure_loss_weights,
+            loss_kind=config.response_loss.kind,
+            smooth_l1_beta=config.response_loss.smooth_l1_beta,
+            huber_delta=config.response_loss.huber_delta,
         ).to(device)
         if config.closure_loss_weights
+        else None
+    )
+    size_spectral_losses = (
+        AerosolSizeSpectralLosses(
+            feature_names_by_modality=feature_name_map,
+            mean_by_modality=mean_by_modality,
+            std_by_modality=std_by_modality,
+            weights=config.size_spectral_loss_weights,
+            loss_kind=config.response_loss.kind,
+            smooth_l1_beta=config.response_loss.smooth_l1_beta,
+            huber_delta=config.response_loss.huber_delta,
+        ).to(device)
+        if config.size_spectral_loss_weights
         else None
     )
 
@@ -718,16 +962,19 @@ def main() -> None:
         AerosolDataset(arrays, arrays.splits["train"]),
         batch_size=config.batch_size,
         shuffle=True,
+        **dataloader_kwargs(config),
     )
     validation_loader = DataLoader(
         AerosolDataset(arrays, arrays.splits["validation"]),
         batch_size=config.batch_size,
         shuffle=False,
+        **dataloader_kwargs(config),
     )
     test_loader = DataLoader(
         AerosolDataset(arrays, arrays.splits["test"]),
         batch_size=config.batch_size,
         shuffle=False,
+        **dataloader_kwargs(config),
     )
 
     optimizer = torch.optim.AdamW(
@@ -753,9 +1000,19 @@ def main() -> None:
         raise ValueError("validation_interval must be positive so a best checkpoint can be selected")
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
+    split_lengths = {name: int(len(indices)) for name, indices in arrays.splits.items()}
+    print(
+        "training setup "
+        f"device={device} rows={arrays.x.shape[0]} features={arrays.x.shape[1]} "
+        f"splits={split_lengths} "
+        f"time_start={arrays.times[0]} time_end={arrays.times[-1]} "
+        f"coordinate_decoders={config.coordinate_decoders}",
+        flush=True,
+    )
 
     history: list[dict[str, float]] = []
     best_validation = float("inf")
+    stage_best_validations: dict[str, float] = {}
     global_epoch = 0
     resume_completed_epochs = 0
     if args.resume_checkpoint:
@@ -779,19 +1036,28 @@ def main() -> None:
         best_validation = float(
             resume_checkpoint.get("best_validation", best_validation_from_history(history))
         )
-        if "optimizer_state" in resume_checkpoint:
+        stage_best_validations = {
+            str(key): float(value)
+            for key, value in resume_checkpoint.get("stage_best_validations", {}).items()
+        }
+        if args.resume_with_fresh_optimizer:
+            print("resuming with fresh optimizer/scheduler state", flush=True)
+        elif "optimizer_state" in resume_checkpoint:
             optimizer.load_state_dict(resume_checkpoint["optimizer_state"])
-        elif not args.resume_with_fresh_optimizer:
+        else:
             raise ValueError(
                 "Resume checkpoint lacks optimizer_state. Re-run with "
                 "--resume-with-fresh-optimizer only when intentionally resuming a "
                 "legacy checkpoint with a fresh optimizer."
             )
         if scheduler is not None:
-            if "scheduler_state" in resume_checkpoint:
+            if args.resume_with_fresh_optimizer:
+                pass
+            elif "scheduler_state" in resume_checkpoint:
                 scheduler.load_state_dict(resume_checkpoint["scheduler_state"])
-            elif args.resume_with_fresh_optimizer:
-                set_cosine_scheduler_epoch(optimizer, scheduler, global_epoch)
+                if isinstance(scheduler, torch.optim.lr_scheduler.CosineAnnealingLR):
+                    scheduler.T_max = max(total_epochs, 1)
+                    set_cosine_scheduler_epoch(optimizer, scheduler, global_epoch)
             else:
                 raise ValueError(
                     "Resume checkpoint lacks scheduler_state. Re-run with "
@@ -800,7 +1066,7 @@ def main() -> None:
                 )
         print(
             f"resuming from epoch={global_epoch} best_validation={best_validation:.5f} "
-            f"fresh_optimizer={args.resume_with_fresh_optimizer and 'optimizer_state' not in resume_checkpoint}",
+            f"fresh_optimizer={args.resume_with_fresh_optimizer}",
             flush=True,
         )
 
@@ -820,27 +1086,51 @@ def main() -> None:
         stage_feature_dropout = float(stage.get("feature_dropout_probability", 0.0))
         stage_feature_noise = float(stage.get("feature_noise_std", 0.0))
         stage_loss_mode = str(stage.get("loss_mode", "all"))
+        stage_closure_losses = closure_losses if bool(stage.get("use_closure_losses", True)) else None
+        stage_size_spectral_losses = (
+            size_spectral_losses if bool(stage.get("use_size_spectral_losses", True)) else None
+        )
+        stage_target_modalities = stage_modalities(
+            stage,
+            "target_modalities",
+            target_modalities,
+            target_modalities,
+        )
+        stage_validation_modalities = stage_modalities(
+            stage,
+            "validation_target_modalities",
+            target_modalities,
+            target_modalities,
+        )
 
         for stage_epoch in range(start_stage_epoch, stage_epochs + 1):
             global_epoch += 1
+            epoch_start = time.perf_counter()
+            train_start = time.perf_counter()
             train_metrics = run_epoch(
                 model,
                 train_loader,
                 arrays,
-                target_modalities,
+                stage_target_modalities,
                 always_input_modalities,
                 config.cross_prediction_exclusion_groups,
+                feature_loss_masks,
                 stage_mode=stage_mode,
                 loss_mode=stage_loss_mode,
                 mask_probability=stage_mask_probability,
                 feature_dropout_probability=stage_feature_dropout,
                 feature_noise_std=stage_feature_noise,
+                response_loss_kind=config.response_loss.kind,
+                smooth_l1_beta=config.response_loss.smooth_l1_beta,
+                huber_delta=config.response_loss.huber_delta,
                 latent_l2_weight=config.latent_l2_weight,
                 kl_weight=float(stage.get("kl_weight", config.kl_weight)),
-                closure_losses=closure_losses,
+                closure_losses=stage_closure_losses,
+                size_spectral_losses=stage_size_spectral_losses,
                 device=device,
                 optimizer=optimizer,
             )
+            train_seconds = time.perf_counter() - train_start
             run_cross_validation = should_run_interval(
                 global_epoch,
                 total_epochs,
@@ -866,14 +1156,19 @@ def main() -> None:
                     target_modalities,
                     always_input_modalities,
                     config.cross_prediction_exclusion_groups,
+                    feature_loss_masks,
                     stage_mode="autoencode",
                     loss_mode="all",
                     mask_probability=0.0,
                     feature_dropout_probability=0.0,
                     feature_noise_std=0.0,
+                    response_loss_kind="mse",
+                    smooth_l1_beta=config.response_loss.smooth_l1_beta,
+                    huber_delta=config.response_loss.huber_delta,
                     latent_l2_weight=0.0,
                     kl_weight=0.0,
                     closure_losses=None,
+                    size_spectral_losses=None,
                     device=device,
                     optimizer=None,
                 )
@@ -883,9 +1178,10 @@ def main() -> None:
                     model,
                     validation_loader,
                     arrays,
-                    target_modalities,
+                    stage_validation_modalities,
                     always_input_modalities,
                     config.cross_prediction_exclusion_groups,
+                    feature_loss_masks,
                     stage_mode=validation_cross_mode,
                     device=device,
                 )
@@ -896,9 +1192,10 @@ def main() -> None:
                         model,
                         validation_loader,
                         arrays,
-                        target_modalities,
+                        stage_validation_modalities,
                         always_input_modalities,
                         config.cross_prediction_exclusion_groups,
+                        feature_loss_masks,
                         stage_mode=mode,
                         device=device,
                     )
@@ -908,7 +1205,17 @@ def main() -> None:
                 "epoch": float(global_epoch),
                 "stage_epoch": float(stage_epoch),
                 "stage": stage_name,
+                "device": str(device),
                 "learning_rate": float(optimizer.param_groups[0]["lr"]),
+                "total_rows": float(arrays.x.shape[0]),
+                "total_features": float(arrays.x.shape[1]),
+                "train_rows": float(split_lengths.get("train", 0)),
+                "validation_rows": float(split_lengths.get("validation", 0)),
+                "test_rows": float(split_lengths.get("test", 0)),
+                "train_seconds": float(train_seconds),
+                "epoch_seconds": float(time.perf_counter() - epoch_start),
+                "stage_target_modalities": "|".join(stage_target_modalities),
+                "stage_validation_modalities": "|".join(stage_validation_modalities),
             }
             row.update({f"train_{key}": value for key, value in train_metrics.items()})
             row.update(
@@ -942,12 +1249,17 @@ def main() -> None:
                 f"epoch={global_epoch} stage={stage_name} mode={stage_mode} "
                 f"loss_mode={stage_loss_mode} "
                 f"train_loss={train_metrics['loss']:.5f} "
-                f"{' '.join(validation_text_parts)}",
+                f"{' '.join(validation_text_parts)} "
+                f"train_seconds={train_seconds:.1f} "
+                f"epoch_seconds={row['epoch_seconds']:.1f}",
                 flush=True,
             )
 
-            if validation_cross_metrics and validation_cross_metrics["loss"] < best_validation:
-                best_validation = validation_cross_metrics["loss"]
+            checkpoint_selection_scope = (
+                "global"
+                if stage_validation_modalities == target_modalities
+                else f"stage:{stage_name}:{'|'.join(stage_validation_modalities)}"
+            )
             if scheduler is not None:
                 scheduler.step()
             payload = checkpoint_payload(
@@ -962,9 +1274,22 @@ def main() -> None:
                 scheduler=scheduler,
                 global_epoch=global_epoch,
                 best_validation=best_validation,
+                stage_best_validations=stage_best_validations,
             )
-            if validation_cross_metrics and validation_cross_metrics["loss"] <= best_validation:
-                torch.save(payload, output / "checkpoint.pt")
+            if validation_cross_metrics:
+                validation_loss = float(validation_cross_metrics["loss"])
+                if checkpoint_selection_scope == "global":
+                    if validation_loss < best_validation:
+                        best_validation = validation_loss
+                        payload["best_validation"] = best_validation
+                    if validation_loss <= best_validation:
+                        torch.save(payload, output / "checkpoint.pt")
+                else:
+                    stage_best = stage_best_validations.get(checkpoint_selection_scope, float("inf"))
+                    if validation_loss <= stage_best:
+                        stage_best_validations[checkpoint_selection_scope] = validation_loss
+                        payload["stage_best_validations"] = dict(stage_best_validations)
+                        torch.save(payload, output / f"checkpoint_{stage_name}.pt")
             torch.save(payload, output / "last_checkpoint.pt")
 
     best_checkpoint = torch.load(output / "checkpoint.pt", map_location=device, weights_only=False)
@@ -976,6 +1301,7 @@ def main() -> None:
         target_modalities,
         always_input_modalities,
         config.cross_prediction_exclusion_groups,
+        feature_loss_masks,
         stage_mode=validation_cross_mode,
         device=device,
     )
@@ -990,6 +1316,7 @@ def main() -> None:
             target_modalities,
             always_input_modalities,
             config.cross_prediction_exclusion_groups,
+            feature_loss_masks,
             stage_mode=mode,
             device=device,
         )

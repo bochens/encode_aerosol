@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import json
+from pathlib import Path
 import re
 from typing import Any
 
@@ -30,14 +32,66 @@ class PreparedArrays:
 
 class AerosolDataset(Dataset):
     def __init__(self, arrays: PreparedArrays, indices: np.ndarray) -> None:
-        self.x = torch.from_numpy(arrays.x[indices].astype(np.float32))
-        self.feature_mask = torch.from_numpy(arrays.feature_mask[indices].astype(np.float32))
+        self.x = arrays.x
+        self.feature_mask = arrays.feature_mask
+        self.indices = np.asarray(indices, dtype=np.int64)
 
     def __len__(self) -> int:
-        return self.x.shape[0]
+        return self.indices.shape[0]
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.x[index], self.feature_mask[index]
+        row = int(self.indices[index])
+        x = torch.as_tensor(self.x[row], dtype=torch.float32)
+        feature_mask = torch.as_tensor(self.feature_mask[row], dtype=torch.float32)
+        return x, feature_mask
+
+
+def save_prepared_arrays(path: str | Path, arrays: PreparedArrays) -> None:
+    metadata = {
+        "feature_names": arrays.feature_names,
+        "modality_indices": arrays.modality_indices,
+        "splits": {key: value.tolist() for key, value in arrays.splits.items()},
+        "dropped_features": arrays.dropped_features,
+    }
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        path,
+        x=arrays.x.astype(np.float32, copy=False),
+        feature_mask=arrays.feature_mask.astype(np.bool_, copy=False),
+        times=arrays.times,
+        raw_feature_indices=np.asarray(arrays.raw_feature_indices, dtype=np.int64),
+        mean=arrays.mean.astype(np.float32, copy=False),
+        std=arrays.std.astype(np.float32, copy=False),
+        metadata_json=np.asarray(json.dumps(metadata)),
+    )
+
+
+def load_prepared_arrays(path: str | Path) -> PreparedArrays:
+    with np.load(path, allow_pickle=False) as data:
+        metadata = json.loads(str(data["metadata_json"].item()))
+        return PreparedArrays(
+            x=data["x"].astype(np.float32, copy=False),
+            feature_mask=data["feature_mask"].astype(np.bool_, copy=False),
+            times=data["times"],
+            modality_indices={
+                modality: [int(index) for index in indices]
+                for modality, indices in metadata["modality_indices"].items()
+            },
+            feature_names=list(metadata["feature_names"]),
+            raw_feature_indices=[
+                int(index) for index in data["raw_feature_indices"].tolist()
+            ],
+            mean=data["mean"].astype(np.float32, copy=False),
+            std=data["std"].astype(np.float32, copy=False),
+            splits={
+                key: np.asarray(value, dtype=np.int64)
+                for key, value in metadata["splits"].items()
+            },
+            dropped_features={
+                modality: list(features)
+                for modality, features in metadata["dropped_features"].items()
+            },
+        )
 
 
 def chronological_splits(
@@ -242,31 +296,35 @@ def prepare_arrays(
         dropped_features,
     )
 
-    selected = matrix[:, selected_raw_indices].astype(np.float32)
+    selected = np.asarray(matrix[:, selected_raw_indices], dtype=np.float32)
+    del matrix
     train_selected = selected[train_indices]
     mean = np.nanmean(train_selected, axis=0).astype(np.float32)
     std = np.nanstd(train_selected, axis=0).astype(np.float32)
+    del train_selected
 
     bad_norm = ~np.isfinite(mean) | ~np.isfinite(std) | (std <= 1e-12)
     if np.any(bad_norm):
         bad_names = [selected_feature_names[idx] for idx in np.flatnonzero(bad_norm)]
         raise ValueError(f"Selected features have invalid normalization statistics: {bad_names[:10]}")
 
-    normalized = (selected - mean) / std
-    feature_mask = np.isfinite(normalized)
-    normalized = np.where(feature_mask, normalized, 0.0).astype(np.float32)
+    selected -= mean
+    selected /= std
+    feature_mask = np.isfinite(selected)
+    selected[~feature_mask] = 0.0
     valid_rows = feature_mask.any(axis=1)
     if not np.any(valid_rows):
         raise ValueError("No rows have any finite selected features")
 
-    normalized = normalized[valid_rows]
-    feature_mask = feature_mask[valid_rows]
-    times = times[valid_rows]
+    if not np.all(valid_rows):
+        selected = selected[valid_rows]
+        feature_mask = feature_mask[valid_rows]
+        times = times[valid_rows]
     splits = make_splits(times, validation_fraction, test_fraction, split_strategy)
 
     return PreparedArrays(
-        x=normalized,
-        feature_mask=feature_mask.astype(np.float32),
+        x=selected.astype(np.float32, copy=False),
+        feature_mask=feature_mask.astype(np.bool_, copy=False),
         times=times,
         modality_indices=selected_modality_indices,
         feature_names=selected_feature_names,

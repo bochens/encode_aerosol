@@ -360,9 +360,17 @@ def load_feature_store(path: str | Path) -> tuple[np.ndarray, np.ndarray, dict[s
     if not metadata_path.is_file():
         raise FileNotFoundError(metadata_path)
 
-    with np.load(npz_path, allow_pickle=False) as payload:
-        matrix = payload["X"].astype(np.float32)
-        times = payload["times"]
+    extracted_matrix_path = npz_path.with_name("X.npy")
+    extracted_times_path = npz_path.with_name("times.npy")
+    if extracted_matrix_path.is_file() and extracted_times_path.is_file():
+        matrix = np.load(extracted_matrix_path, mmap_mode="r")
+        times = np.load(extracted_times_path, allow_pickle=False)
+        if matrix.dtype != np.float32:
+            matrix = matrix.astype(np.float32)
+    else:
+        with np.load(npz_path, allow_pickle=False) as payload:
+            matrix = payload["X"].astype(np.float32, copy=False)
+            times = payload["times"]
     with metadata_path.open("r", encoding="utf-8") as handle:
         metadata = json.load(handle)
     return matrix, times, metadata
