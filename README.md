@@ -1,7 +1,15 @@
 # Encode Aerosol
 
-Research code for learning compact multimodal atmospheric aerosol representations
-from ARM Southern Great Plains E13 aerosol and AOS meteorology measurements.
+Encode Aerosol is research code for learning compact multimodal atmospheric
+aerosol representations from ARM Southern Great Plains E13 aerosol and AOS
+meteorology measurements. The project explores whether combined ambient aerosol
+instrument records can encode size, composition, optical response, and CCN
+activation in a shared latent state.
+
+This research code and documentation were developed with assistance from
+OpenAI Codex for implementation, experiment management, and technical writing.
+Scientific direction, interpretation, and responsibility for the work remain
+with the project author.
 
 The main model is a deterministic multimodal transformer autoencoder. It maps a
 30-minute aerosol state into a 64-dimensional bottleneck and retrieves measured
@@ -128,5 +136,4 @@ python -m kappa_ccn_baseline.random_forest_baseline \
 
 ## License
 
-No open-source license has been selected yet. Add a license before making the
-GitHub repository public.
+This project is released under the MIT License. See [LICENSE](LICENSE).

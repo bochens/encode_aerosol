@@ -37,6 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kappa-organic", type=float, default=0.12)
     parser.add_argument("--kappa-inorganic", type=float, default=0.63)
     parser.add_argument("--fraction-basis", choices=["mass", "volume"], default="mass")
+    parser.add_argument("--kappa-mixing-rule", choices=["geometric", "linear"], default="geometric")
     parser.add_argument("--organic-density", type=float, default=1.4)
     parser.add_argument("--inorganic-density", type=float, default=1.75)
     parser.add_argument(
@@ -76,6 +77,7 @@ def main() -> None:
         kappa_organic=args.kappa_organic,
         kappa_inorganic=args.kappa_inorganic,
         fraction_basis=args.fraction_basis,
+        mixing_rule=args.kappa_mixing_rule,
         organic_density_g_cm3=args.organic_density,
         inorganic_density_g_cm3=args.inorganic_density,
     )
@@ -128,6 +130,7 @@ def main() -> None:
                     "organic_fraction": organic_fraction,
                     "inorganic_fraction": inorganic_fraction,
                     "fraction_basis": recipe.fraction_basis,
+                    "kappa_mixing_rule": recipe.mixing_rule,
                     "critical_diameter_nm": dcrit_nm,
                     "predicted_ccn_cm3": predicted,
                     "observed_ccn_cm3": observed,
@@ -154,6 +157,7 @@ def main() -> None:
             "kappa_organic": recipe.kappa_organic,
             "kappa_inorganic": recipe.kappa_inorganic,
             "fraction_basis": recipe.fraction_basis,
+            "kappa_mixing_rule": recipe.mixing_rule,
             "organic_density_g_cm3": recipe.organic_density_g_cm3,
             "inorganic_density_g_cm3": recipe.inorganic_density_g_cm3,
             "merge_transition_decades": args.merge_transition_decades,

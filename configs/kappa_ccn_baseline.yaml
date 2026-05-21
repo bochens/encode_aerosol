@@ -7,6 +7,7 @@ kappa_recipe:
   kappa_organic: 0.12
   kappa_inorganic: 0.63
   fraction_basis: mass
+  kappa_mixing_rule: geometric
   # Densities are only used when fraction_basis is set to volume.
   organic_density_g_cm3: 1.4
   inorganic_density_g_cm3: 1.75

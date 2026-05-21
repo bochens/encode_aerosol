@@ -13,12 +13,15 @@ class ACSMKappaRecipe:
     Poehlker et al. (2023). ACSM species are treated as bulk organic and bulk
     inorganic mass. The default `mass` basis follows the ACSM/AMS shortcut in
     Poehlker et al. (2023); `volume` is available for the original component
-    volume-fraction mixing rule from Petters and Kreidenweis (2007).
+    volume-fraction basis from Petters and Kreidenweis (2007). The default
+    row-level bulk mixing rule is geometric so ambient bulk kappa is handled in
+    log space.
     """
 
     kappa_organic: float = 0.12
     kappa_inorganic: float = 0.63
     fraction_basis: str = "mass"
+    mixing_rule: str = "geometric"
     organic_density_g_cm3: float = 1.4
     inorganic_density_g_cm3: float = 1.75
     min_total_amount: float = 1.0e-12
@@ -30,6 +33,27 @@ def _nonnegative(value: float) -> float:
     if not np.isfinite(value):
         return float("nan")
     return max(float(value), 0.0)
+
+
+def _mixed_kappa(
+    organic_fraction: float,
+    inorganic_fraction: float,
+    recipe: ACSMKappaRecipe,
+) -> float:
+    if recipe.mixing_rule == "linear":
+        return (
+            organic_fraction * recipe.kappa_organic
+            + inorganic_fraction * recipe.kappa_inorganic
+        )
+    if recipe.mixing_rule == "geometric":
+        if recipe.kappa_organic <= 0.0 or recipe.kappa_inorganic <= 0.0:
+            raise ValueError("Geometric kappa mixing requires positive component kappas.")
+        log_kappa = (
+            organic_fraction * np.log(recipe.kappa_organic)
+            + inorganic_fraction * np.log(recipe.kappa_inorganic)
+        )
+        return float(np.exp(log_kappa))
+    raise ValueError("mixing_rule must be 'geometric' or 'linear'")
 
 
 def kappa_from_acsm_masses(
@@ -66,10 +90,7 @@ def kappa_from_acsm_masses(
     if not np.isfinite(organic_fraction) or not np.isfinite(inorganic_fraction):
         return float("nan")
 
-    kappa = (
-        organic_fraction * recipe.kappa_organic
-        + inorganic_fraction * recipe.kappa_inorganic
-    )
+    kappa = _mixed_kappa(organic_fraction, inorganic_fraction, recipe)
     return float(np.clip(kappa, recipe.min_kappa, recipe.max_kappa))
 
 
@@ -125,6 +146,7 @@ def acsm_volume_fractions(
         kappa_organic=recipe.kappa_organic,
         kappa_inorganic=recipe.kappa_inorganic,
         fraction_basis="volume",
+        mixing_rule=recipe.mixing_rule,
         organic_density_g_cm3=recipe.organic_density_g_cm3,
         inorganic_density_g_cm3=recipe.inorganic_density_g_cm3,
         min_total_amount=recipe.min_total_amount,

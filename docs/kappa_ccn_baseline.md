@@ -8,7 +8,7 @@ composition and particle number size distributions.
 
 1. ACSM chemistry is converted to a bulk hygroscopicity parameter:
 
-   `kappa_chem = eps_org * kappa_org + eps_inorg * kappa_inorg`
+   `kappa_chem = exp(eps_org * log(kappa_org) + eps_inorg * log(kappa_inorg))`
 
    where `eps` are ACSM organic/inorganic mass fractions by default. The
    starter defaults are
@@ -17,7 +17,8 @@ composition and particle number size distributions.
    ammonium, nitrate, and chloride are grouped as inorganic mass. Black carbon
    is not included in this first pass because the current feature set does not
    expose a BC modality. A `volume` basis is also available for sensitivity
-   tests against the original component volume-fraction mixing rule.
+   tests. A `linear` mixing rule is kept as an explicit reproducibility option,
+   but the default row-level bulk ambient kappa is mixed geometrically.
 
 2. SMPS, UHSAS, OPC, and APS dN/dlogDp spectra are merged onto the existing
    common diameter grid. Each instrument is first averaged over available
@@ -63,6 +64,7 @@ python -m kappa_ccn_baseline.run_baseline \
   --prepared-arrays artifacts/temporal_gru_30min_20161129_20230421/features/prepared_arrays.npz \
   --split test \
   --fraction-basis mass \
+  --kappa-mixing-rule geometric \
   --limit-rows 5000 \
   --output artifacts/kappa_ccn_baseline_smoke
 ```
@@ -74,6 +76,7 @@ python -m kappa_ccn_baseline.run_baseline \
   --prepared-arrays artifacts/temporal_gru_30min_20161129_20230421/features/prepared_arrays.npz \
   --split test \
   --fraction-basis mass \
+  --kappa-mixing-rule geometric \
   --output artifacts/kappa_ccn_baseline
 ```
 
