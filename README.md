@@ -2,9 +2,17 @@
 
 Encode Aerosol is research code for learning compact multimodal atmospheric
 aerosol representations from ARM Southern Great Plains E13 aerosol and AOS
-meteorology measurements. The project explores whether combined ambient aerosol
-instrument records can encode size, composition, optical response, and CCN
-activation in a shared latent state.
+meteorology measurements.
+
+The project has two linked experimental goals:
+
+1. Scientific experiment: test whether neural networks can encode complex
+   ambient aerosol states that are difficult to represent with traditional
+   low-dimensional assumptions, including size, composition, optical response,
+   and CCN activation in a shared latent state.
+2. Research-process experiment: test whether an AI coding agent can drive a
+   scientific software workflow end-to-end while the human researcher stays in a
+   supervision, steering, and scientific-judgment role.
 
 This research code and documentation were developed with assistance from
 OpenAI Codex for implementation, experiment management, and technical writing.
